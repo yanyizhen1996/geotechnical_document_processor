@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "document-processor"
+version = "0.1.0"
+description = "Local batch document processing desktop application."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7,<7",
+    "openpyxl>=3.1,<4",
+    "pypdf>=5,<7",
+    "python-docx>=1.1,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+document-processor = "document_processor.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
