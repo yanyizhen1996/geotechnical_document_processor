@@ -1,10 +1,11 @@
+import csv
 import json
 from types import SimpleNamespace
 
 from pypdf import PdfWriter
 from PySide6.QtWidgets import QApplication, QGroupBox, QScrollArea
 
-from document_processor.app import ATTERBERG_LIMITS_PROMPT, DocumentProcessorWindow, _write_results_file
+from document_processor.app import SOIL_LAB_SUMMARY_PROMPT, DocumentProcessorWindow, _write_csv_file, _write_results_file
 from document_processor.domain import ProcessingMode, inspect_document
 
 
@@ -17,6 +18,67 @@ def test_write_results_file_creates_json_output(tmp_path) -> None:
     assert output_path.read_text(encoding="utf-8") == '[{"status":"completed"}]'
 
 
+def test_write_csv_file_flattens_each_sample_result(tmp_path) -> None:
+    results = json.dumps(
+        [
+            {
+                "document": "report.pdf",
+                "input_mode": "pdf_images",
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "test_type": "Liquid and Plastic Limits",
+                        "samples": [
+                            {
+                                "borehole": "PB-20",
+                                "sample_id": "S-15",
+                                "depth": "57-59 ft",
+                                "key_results": [
+                                    {"name": "Liquid Limit", "value": "67", "unit": "%"},
+                                    {"name": "Plasticity Index", "value": "42", "unit": "%"},
+                                ],
+                            }
+                        ],
+                    }
+                ),
+            }
+        ]
+    )
+    json_output_path = _write_results_file(results, tmp_path)
+
+    csv_output_path = _write_csv_file(results, json_output_path)
+
+    with csv_output_path.open(encoding="utf-8-sig", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert csv_output_path == json_output_path.with_suffix(".csv")
+    assert rows == [
+        {
+            "document": "report.pdf",
+            "input_mode": "pdf_images",
+            "status": "completed",
+            "test_type": "Liquid and Plastic Limits",
+            "borehole": "PB-20",
+            "sample_id": "S-15",
+            "depth": "57-59 ft",
+            "result_name": "Liquid Limit",
+            "result_value": "67",
+            "result_unit": "%",
+        },
+        {
+            "document": "report.pdf",
+            "input_mode": "pdf_images",
+            "status": "completed",
+            "test_type": "Liquid and Plastic Limits",
+            "borehole": "PB-20",
+            "sample_id": "S-15",
+            "depth": "57-59 ft",
+            "result_name": "Plasticity Index",
+            "result_value": "42",
+            "result_unit": "%",
+        },
+    ]
+
+
 def test_window_layout_supports_compact_resizing() -> None:
     application = QApplication.instance() or QApplication([])
     window = DocumentProcessorWindow()
@@ -27,29 +89,40 @@ def test_window_layout_supports_compact_resizing() -> None:
     assert window.size().width() == 800
     assert window.size().height() == 600
     assert len(window.findChildren(QScrollArea)) == 2
-    assert isinstance(window.schema_editor.parentWidget(), QGroupBox)
+    assert isinstance(window.output_structure_editor.parentWidget(), QGroupBox)
     assert "Batch estimate" not in [group.title() for group in window.findChildren(QGroupBox)]
+    assert window.processing_mode_combo.currentData() == ProcessingMode.PDF_IMAGES
 
     window.close()
 
 
-def test_atterberg_limits_template_populates_a_flat_output_contract() -> None:
+def test_soil_lab_summary_template_populates_a_compact_output_structure() -> None:
     application = QApplication.instance() or QApplication([])
     window = DocumentProcessorWindow()
 
-    assert window.contract_template_combo.currentData() == "atterberg_limits"
-    assert window.prompt_editor.toPlainText() == ATTERBERG_LIMITS_PROMPT
-    schema = json.loads(window.schema_editor.toPlainText())
-    assert schema["required"] == ["pi", "ll", "pl", "source_citation"]
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["pi"]["type"] == ["number", "null"]
+    assert window.contract_template_combo.currentData() == "soil_lab_summary"
+    assert window.prompt_editor.toPlainText() == SOIL_LAB_SUMMARY_PROMPT
+    output_structure = json.loads(window.output_structure_editor.toPlainText())
+    assert output_structure["required"] == ["test_type", "samples"]
+    assert output_structure["additionalProperties"] is False
+    assert output_structure["properties"]["samples"]["type"] == "array"
+    sample_structure = output_structure["properties"]["samples"]["items"]
+    assert sample_structure["required"] == ["borehole", "sample_id", "depth", "key_results"]
+    assert sample_structure["properties"]["key_results"]["items"]["properties"] == {
+        "name": {"type": ["string", "null"]},
+        "value": {"type": ["string", "null"]},
+        "unit": {"type": ["string", "null"]},
+    }
+    assert window.contract_template_combo.count() == 2
 
     window.prompt_editor.setPlainText("Keep this custom prompt")
+    window.output_structure_editor.setPlainText('{"type": "object"}')
     window.contract_template_combo.setCurrentIndex(window.contract_template_combo.findData(None))
     window.apply_template_button.click()
 
     assert application is not None
     assert window.prompt_editor.toPlainText() == "Keep this custom prompt"
+    assert window.output_structure_editor.toPlainText() == '{"type": "object"}'
     window.close()
 
 
