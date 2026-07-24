@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import sys
 import threading
@@ -48,25 +49,52 @@ from .providers import (
 )
 
 
-ATTERBERG_LIMITS_TEMPLATE_KEY = "atterberg_limits"
-ATTERBERG_LIMITS_PROMPT = (
-    "Extract the Atterberg limits for the tested sample. Use only reported values. "
-    "Return null for PI, LL, or PL when a value is not stated. "
-    "For source_citation, identify the page and table or row containing the values."
+SOIL_LAB_SUMMARY_TEMPLATE_KEY = "soil_lab_summary"
+SOIL_LAB_SUMMARY_PROMPT = (
+    "Review the soil laboratory report and extract only the information needed for a geotechnical laboratory "
+    "summary table. Set test_type to the reported laboratory test or standard. Add one samples item for each "
+    "tested sample, with its borehole or sample location, sample ID, depth, and only its final reportable test "
+    "results. Include classification only when it is reported as a final test result. Do not extract client, "
+    "project details, report dates, personnel, intermediate weights, calculations, narrative summaries, or other "
+    "metadata. Preserve reported values and units. Use null for unavailable sample identifiers and an empty results "
+    "list only when a tested sample has no reportable final results."
 )
-ATTERBERG_LIMITS_SCHEMA = {
+SOIL_LAB_SUMMARY_STRUCTURE = {
     "type": "object",
     "properties": {
-        "pi": {"type": ["number", "null"], "description": "Plasticity index"},
-        "ll": {"type": ["number", "null"], "description": "Liquid limit"},
-        "pl": {"type": ["number", "null"], "description": "Plastic limit"},
-        "source_citation": {"type": ["string", "null"], "description": "Source page and table or row"},
+        "test_type": {"type": ["string", "null"], "description": "Reported laboratory test or standard"},
+        "samples": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "borehole": {"type": ["string", "null"], "description": "Borehole or sample location"},
+                    "sample_id": {"type": ["string", "null"], "description": "Reported sample identifier"},
+                    "depth": {"type": ["string", "null"], "description": "Reported depth or depth interval"},
+                    "key_results": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": ["string", "null"]},
+                                "value": {"type": ["string", "null"]},
+                                "unit": {"type": ["string", "null"]},
+                            },
+                            "required": ["name", "value", "unit"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["borehole", "sample_id", "depth", "key_results"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["pi", "ll", "pl", "source_citation"],
+    "required": ["test_type", "samples"],
     "additionalProperties": False,
 }
-CONTRACT_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
-    ATTERBERG_LIMITS_TEMPLATE_KEY: (ATTERBERG_LIMITS_PROMPT, ATTERBERG_LIMITS_SCHEMA),
+EXTRACTION_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
+    SOIL_LAB_SUMMARY_TEMPLATE_KEY: (SOIL_LAB_SUMMARY_PROMPT, SOIL_LAB_SUMMARY_STRUCTURE),
 }
 
 
@@ -163,34 +191,34 @@ class DocumentProcessorWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        prompt_group = QGroupBox("2. Task and output contract")
+        prompt_group = QGroupBox("2. Extraction instructions")
         prompt_layout = QVBoxLayout(prompt_group)
         mode_layout = QFormLayout()
         self.processing_mode_combo = QComboBox()
-        self.processing_mode_combo.addItem("Extracted text (Not Recommended for PDF Processing)", ProcessingMode.TEXT)
         self.processing_mode_combo.addItem("PDF page images (vision model)", ProcessingMode.PDF_IMAGES)
+        self.processing_mode_combo.addItem("Extracted text (Not Recommended for PDF Processing)", ProcessingMode.TEXT)
         mode_layout.addRow("Document input", self.processing_mode_combo)
         template_controls = QWidget()
         template_layout = QHBoxLayout(template_controls)
         template_layout.setContentsMargins(0, 0, 0, 0)
         self.contract_template_combo = QComboBox()
-        self.contract_template_combo.addItem("Atterberg limits (PI, LL, PL)", ATTERBERG_LIMITS_TEMPLATE_KEY)
-        self.contract_template_combo.addItem("Custom (edit prompt and schema)", None)
+        self.contract_template_combo.addItem("Soil laboratory summary", SOIL_LAB_SUMMARY_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Custom (edit task and output structure)", None)
         template_layout.addWidget(self.contract_template_combo)
         self.apply_template_button = QPushButton("Apply template")
         self.apply_template_button.clicked.connect(self._apply_selected_template)
         template_layout.addWidget(self.apply_template_button)
         mode_layout.addRow("Extraction template", template_controls)
         prompt_layout.addLayout(mode_layout)
-        prompt_layout.addWidget(QLabel("Task prompt (applied independently to every document)"))
+        prompt_layout.addWidget(QLabel("Task instructions (applied independently to every document)"))
         self.prompt_editor = QPlainTextEdit()
-        self.prompt_editor.setPlaceholderText("Example: Extract PI, LL, and PL values. Return the defined JSON object and cite the source page or row.")
+        self.prompt_editor.setPlaceholderText("Describe the information to identify in each document.")
         self.prompt_editor.setMinimumHeight(105)
         prompt_layout.addWidget(self.prompt_editor)
-        prompt_layout.addWidget(QLabel("JSON output schema"))
-        self.schema_editor = QPlainTextEdit()
-        self.schema_editor.setMinimumHeight(185)
-        prompt_layout.addWidget(self.schema_editor)
+        prompt_layout.addWidget(QLabel("Output structure (editable JSON)"))
+        self.output_structure_editor = QPlainTextEdit()
+        self.output_structure_editor.setMinimumHeight(185)
+        prompt_layout.addWidget(self.output_structure_editor)
         self._apply_selected_template()
         layout.addWidget(prompt_group)
 
@@ -233,9 +261,9 @@ class DocumentProcessorWindow(QMainWindow):
         template_key = self.contract_template_combo.currentData()
         if template_key is None:
             return
-        prompt, schema = CONTRACT_TEMPLATES[template_key]
+        prompt, output_structure = EXTRACTION_TEMPLATES[template_key]
         self.prompt_editor.setPlainText(prompt)
-        self.schema_editor.setPlainText(json.dumps(schema, indent=2))
+        self.output_structure_editor.setPlainText(json.dumps(output_structure, indent=2))
 
     def _build_queue_panel(self) -> QWidget:
         panel = QGroupBox("4. Results queue")
@@ -255,7 +283,7 @@ class DocumentProcessorWindow(QMainWindow):
         layout.addLayout(actions)
         self.results_editor = QPlainTextEdit()
         self.results_editor.setReadOnly(True)
-        self.results_editor.setPlaceholderText("Validated Foundry responses will appear here. Results are not written to disk in this slice.")
+        self.results_editor.setPlaceholderText("Completed batch results will appear here and be saved as JSON and CSV files.")
         self.results_editor.setMinimumHeight(100)
         layout.addWidget(self.results_editor)
         return panel
@@ -351,12 +379,12 @@ class DocumentProcessorWindow(QMainWindow):
                 )
                 return False
         try:
-            schema = json.loads(self.schema_editor.toPlainText())
+            output_structure = json.loads(self.output_structure_editor.toPlainText())
         except json.JSONDecodeError as error:
-            QMessageBox.warning(self, "Invalid output schema", f"The JSON schema cannot be parsed: {error.msg}")
+            QMessageBox.warning(self, "Invalid output structure", f"The output structure cannot be parsed: {error.msg}")
             return False
-        if schema.get("type") != "object":
-            QMessageBox.warning(self, "Invalid output schema", "The initial output contract must define an object schema.")
+        if output_structure.get("type") != "object":
+            QMessageBox.warning(self, "Invalid output structure", "The output structure must define a JSON object.")
             return False
         if show_success:
             self.queue_status.setText("Batch is valid. Configure Microsoft Foundry to enable processing.")
@@ -375,14 +403,14 @@ class DocumentProcessorWindow(QMainWindow):
     def _run_batch(self) -> None:
         try:
             prompt = self.prompt_editor.toPlainText().strip()
-            schema = json.loads(self.schema_editor.toPlainText())
+            output_structure = json.loads(self.output_structure_editor.toPlainText())
             mode = ProcessingMode(self.processing_mode_combo.currentData())
             results: list[dict[str, object]] = []
             for document in self._documents:
                 if not document.is_ready:
                     continue
                 if mode is ProcessingMode.PDF_IMAGES:
-                    response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, schema)
+                    response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, output_structure)
                 else:
                     artifact = self._artifacts.get(document.path)
                     if artifact is None:
@@ -391,7 +419,7 @@ class DocumentProcessorWindow(QMainWindow):
                     if artifact.status is not ExtractionStatus.COMPLETE or not artifact.content.strip():
                         results.append({"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings})
                         continue
-                    response = self._provider.process_document(artifact.content, prompt, schema)
+                    response = self._provider.process_document(artifact.content, prompt, output_structure)
                 results.append({"document": document.path.name, "input_mode": mode.value, "status": "completed", **response})
         except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
             self.batch_failed.emit(str(error))
@@ -402,10 +430,11 @@ class DocumentProcessorWindow(QMainWindow):
         self.results_editor.setPlainText(results)
         try:
             output_path = _write_results_file(results)
-        except OSError as error:
+            csv_output_path = _write_csv_file(results, output_path)
+        except (OSError, TypeError, json.JSONDecodeError) as error:
             self.queue_status.setText(f"Batch completed, but results could not be written to disk: {error}")
         else:
-            self.queue_status.setText(f"Batch completed. Results written to {output_path}")
+            self.queue_status.setText(f"Batch completed. Results written to {output_path} and {csv_output_path}")
         self._refresh_provider_state()
 
     def _on_batch_failed(self, error: str) -> None:
@@ -428,3 +457,59 @@ def _write_results_file(results: str, output_dir: Path | None = None) -> Path:
     output_path = directory / f"document_processor_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     output_path.write_text(results, encoding="utf-8")
     return output_path
+
+
+CSV_FIELDNAMES = (
+    "document",
+    "input_mode",
+    "status",
+    "test_type",
+    "borehole",
+    "sample_id",
+    "depth",
+    "result_name",
+    "result_value",
+    "result_unit",
+)
+
+
+def _write_csv_file(results: str, json_output_path: Path) -> Path:
+    """Flatten completed soil laboratory results into one CSV row per reported result."""
+    batch_results = json.loads(results)
+    csv_output_path = json_output_path.with_suffix(".csv")
+    with csv_output_path.open("w", encoding="utf-8-sig", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        for batch_result in batch_results:
+            batch_context = {
+                "document": batch_result.get("document"),
+                "input_mode": batch_result.get("input_mode"),
+                "status": batch_result.get("status"),
+            }
+            extracted_result = json.loads(batch_result.get("text", "{}"))
+            result_context = {**batch_context, "test_type": extracted_result.get("test_type")}
+            samples = extracted_result.get("samples", [])
+            if not samples:
+                writer.writerow(result_context)
+                continue
+            for sample in samples:
+                sample_context = {
+                    **result_context,
+                    "borehole": sample.get("borehole"),
+                    "sample_id": sample.get("sample_id"),
+                    "depth": sample.get("depth"),
+                }
+                key_results = sample.get("key_results", [])
+                if not key_results:
+                    writer.writerow(sample_context)
+                    continue
+                for key_result in key_results:
+                    writer.writerow(
+                        {
+                            **sample_context,
+                            "result_name": key_result.get("name"),
+                            "result_value": key_result.get("value"),
+                            "result_unit": key_result.get("unit"),
+                        }
+                    )
+    return csv_output_path

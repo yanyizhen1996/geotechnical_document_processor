@@ -296,7 +296,7 @@ def _build_document_prompt(prompt: str, schema: dict[str, Any], content: str) ->
     """Build a self-contained, document-specific request without earlier results."""
     return (
         f"Task: {prompt}\n\n"
-        "Return valid JSON only, matching this JSON Schema exactly:\n"
+        "Return valid JSON only, matching this output structure exactly:\n"
         f"{json.dumps(schema, ensure_ascii=False)}\n\n"
         "Document content:\n"
         f"{content}"
