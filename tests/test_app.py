@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 
 from pypdf import PdfWriter
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QGroupBox, QScrollArea
 
 from document_processor.app import DocumentProcessorWindow, _write_results_file
 from document_processor.domain import ProcessingMode, inspect_document
@@ -15,6 +15,22 @@ def test_write_results_file_creates_json_output(tmp_path) -> None:
     assert output_path.name.startswith("document_processor_results_")
     assert output_path.suffix == ".json"
     assert output_path.read_text(encoding="utf-8") == '[{"status":"completed"}]'
+
+
+def test_window_layout_supports_compact_resizing() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = DocumentProcessorWindow()
+    window.resize(800, 600)
+    window.show()
+    application.processEvents()
+
+    assert window.size().width() == 800
+    assert window.size().height() == 600
+    assert len(window.findChildren(QScrollArea)) == 2
+    assert isinstance(window.schema_editor.parentWidget(), QGroupBox)
+    assert "Batch estimate" not in [group.title() for group in window.findChildren(QGroupBox)]
+
+    window.close()
 
 
 def test_image_mode_renders_a_pdf_and_uses_the_image_provider(tmp_path) -> None:

@@ -34,13 +34,6 @@ class ProviderReadiness:
 
 
 @dataclass(frozen=True, slots=True)
-class UsageEstimate:
-    request_count: int
-    estimate_label: str
-    details: str
-
-
-@dataclass(frozen=True, slots=True)
 class MicrosoftFoundryConfiguration:
     """API-key configuration for Microsoft Foundry model inference."""
 
@@ -64,10 +57,6 @@ class DocumentProvider(ABC):
     @abstractmethod
     def readiness(self) -> ProviderReadiness:
         """Return setup readiness without exposing credentials."""
-
-    @abstractmethod
-    def estimate(self, document_count: int) -> UsageEstimate:
-        """Estimate provider-specific usage before submitting a batch."""
 
     @abstractmethod
     def process_document(self, content: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -105,13 +94,6 @@ class MicrosoftFoundryProvider(DocumentProvider):
             and bool(self._configuration.api_key.strip())
             and bool(self._configuration.model_id.strip()),
             message,
-        )
-
-    def estimate(self, document_count: int) -> UsageEstimate:
-        return UsageEstimate(
-            document_count,
-            "Estimated Microsoft Foundry requests",
-            "Cost depends on the configured model pricing and token usage telemetry.",
         )
 
     def process_document(self, content: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:

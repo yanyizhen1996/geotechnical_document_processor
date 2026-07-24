@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -69,7 +70,8 @@ class DocumentProcessorWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Document Processor")
-        self.resize(1280, 820)
+        self.setMinimumSize(800, 600)
+        self.resize(1180, 760)
         self._documents: list[DocumentItem] = []
         self._artifacts: dict[Path, ExtractionArtifact] = {}
         self._provider = MicrosoftFoundryProvider()
@@ -88,16 +90,17 @@ class DocumentProcessorWindow(QMainWindow):
         header = QLabel("Document Processor")
         header.setObjectName("title")
         layout.addWidget(header)
-        layout.addWidget(
-            QLabel(
-                "Process each document in an isolated request. No documents are sent until a provider is configured."
-            )
+        description = QLabel(
+            "Process each document in an isolated request. No documents are sent until a provider is configured."
         )
+        description.setWordWrap(True)
+        layout.addWidget(description)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_document_panel())
-        splitter.addWidget(self._build_configuration_panel())
-        splitter.setSizes([510, 720])
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._scrollable_panel(self._build_document_panel()))
+        splitter.addWidget(self._scrollable_panel(self._build_configuration_panel()))
+        splitter.setSizes([470, 650])
         layout.addWidget(splitter, 1)
         layout.addWidget(self._build_queue_panel())
         self.setStyleSheet(
@@ -107,10 +110,21 @@ class DocumentProcessorWindow(QMainWindow):
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }"
         )
 
+    def _scrollable_panel(self, panel: QWidget) -> QScrollArea:
+        scroll_area = QScrollArea()
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(panel)
+        return scroll_area
+
     def _build_document_panel(self) -> QWidget:
         panel = QGroupBox("1. Document set")
         layout = QVBoxLayout(panel)
-        layout.addWidget(QLabel("Supported: PDF, CSV, XLSX, DOCX, DOC. Use preflight to inspect content locally; nothing is uploaded."))
+        supported_formats = QLabel(
+            "Supported: PDF, CSV, XLSX, DOCX, DOC. Use preflight to inspect content locally; nothing is uploaded."
+        )
+        supported_formats.setWordWrap(True)
+        layout.addWidget(supported_formats)
 
         self.document_table = QTableWidget(0, 3)
         self.document_table.setHorizontalHeaderLabels(["Document", "Status", "Details"])
@@ -146,17 +160,16 @@ class DocumentProcessorWindow(QMainWindow):
         self.processing_mode_combo = QComboBox()
         self.processing_mode_combo.addItem("Extracted text", ProcessingMode.TEXT)
         self.processing_mode_combo.addItem("PDF page images (vision model)", ProcessingMode.PDF_IMAGES)
-        self.processing_mode_combo.currentIndexChanged.connect(self._update_estimate)
         mode_layout.addRow("Document input", self.processing_mode_combo)
         prompt_layout.addLayout(mode_layout)
         prompt_layout.addWidget(QLabel("Task prompt (applied independently to every document)"))
         self.prompt_editor = QPlainTextEdit()
         self.prompt_editor.setPlaceholderText("Example: Extract PI, LL, and PL values. Return the defined JSON object and cite the source page or row.")
-        self.prompt_editor.setFixedHeight(105)
+        self.prompt_editor.setMinimumHeight(105)
         prompt_layout.addWidget(self.prompt_editor)
         prompt_layout.addWidget(QLabel("JSON output schema"))
         self.schema_editor = QPlainTextEdit(json.dumps(DEFAULT_SCHEMA, indent=2))
-        self.schema_editor.setFixedHeight(185)
+        self.schema_editor.setMinimumHeight(185)
         prompt_layout.addWidget(self.schema_editor)
         layout.addWidget(prompt_group)
 
@@ -192,20 +205,11 @@ class DocumentProcessorWindow(QMainWindow):
         provider_layout.addRow("Configuration", self.provider_note)
         layout.addWidget(provider_group)
 
-        estimate_group = QGroupBox("4. Batch estimate")
-        estimate_layout = QGridLayout(estimate_group)
-        self.estimate_label = QLabel("Add documents to calculate the estimated request count.")
-        self.estimate_label.setWordWrap(True)
-        estimate_layout.addWidget(self.estimate_label, 0, 0)
-        estimate_button = QPushButton("Refresh estimate")
-        estimate_button.clicked.connect(self._update_estimate)
-        estimate_layout.addWidget(estimate_button, 0, 1)
-        layout.addWidget(estimate_group)
         layout.addStretch()
         return panel
 
     def _build_queue_panel(self) -> QWidget:
-        panel = QGroupBox("5. Results queue")
+        panel = QGroupBox("4. Results queue")
         layout = QVBoxLayout(panel)
         actions = QHBoxLayout()
         self.queue_status = QLabel("Draft batch — no provider requests have been made.")
@@ -223,7 +227,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.results_editor = QPlainTextEdit()
         self.results_editor.setReadOnly(True)
         self.results_editor.setPlaceholderText("Validated Foundry responses will appear here. Results are not written to disk in this slice.")
-        self.results_editor.setFixedHeight(140)
+        self.results_editor.setMinimumHeight(100)
         layout.addWidget(self.results_editor)
         return panel
 
@@ -253,7 +257,6 @@ class DocumentProcessorWindow(QMainWindow):
             self.document_table.setItem(row, 2, QTableWidgetItem(self._document_detail(item)))
         ready_count = sum(item.is_ready for item in self._documents)
         self.document_count_label.setText(f"{ready_count} ready")
-        self._update_estimate()
 
     def _document_detail(self, item: DocumentItem) -> str:
         artifact = self._artifacts.get(item.path)
@@ -298,10 +301,6 @@ class DocumentProcessorWindow(QMainWindow):
         readiness = self._provider.readiness()
         self.provider_status.setText(readiness.message)
         self.process_button.setEnabled(readiness.ready)
-
-    def _update_estimate(self) -> None:
-        estimate = self._provider.estimate(sum(item.is_ready for item in self._documents))
-        self.estimate_label.setText(f"{estimate.request_count} {estimate.estimate_label.lower()}. {estimate.details}")
 
     def _validate_batch(self, show_success: bool = True) -> bool:
         prompt = self.prompt_editor.toPlainText().strip()
