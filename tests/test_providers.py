@@ -49,7 +49,8 @@ def test_microsoft_foundry_sends_configured_request_payload(monkeypatch: pytest.
                         "content": '{"pi": 12}'
                     }
                 }
-            ]
+            ],
+            "usage": {"total_tokens": 123},
         }
 
     monkeypatch.setattr(provider, "_post_json", fake_post)
@@ -57,6 +58,7 @@ def test_microsoft_foundry_sends_configured_request_payload(monkeypatch: pytest.
     result = provider.process_document("document-only content", "Extract PI", {"type": "object"})
 
     assert result["text"] == '{"pi": 12}'
+    assert "usage" not in result
     assert calls[0][0].startswith("https://example.foundry.microsoft.com")
     payload = calls[0][1]
     assert payload["model"] == "gpt-4.1-mini"

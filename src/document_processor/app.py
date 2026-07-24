@@ -48,16 +48,25 @@ from .providers import (
 )
 
 
-DEFAULT_SCHEMA = {
+ATTERBERG_LIMITS_TEMPLATE_KEY = "atterberg_limits"
+ATTERBERG_LIMITS_PROMPT = (
+    "Extract the Atterberg limits for the tested sample. Use only reported values. "
+    "Return null for PI, LL, or PL when a value is not stated. "
+    "For source_citation, identify the page and table or row containing the values."
+)
+ATTERBERG_LIMITS_SCHEMA = {
     "type": "object",
     "properties": {
-        "pi": {"type": "number", "description": "Plasticity index"},
-        "ll": {"type": "number", "description": "Liquid limit"},
-        "pl": {"type": "number", "description": "Plastic limit"},
-        "source_citation": {"type": "string"},
+        "pi": {"type": ["number", "null"], "description": "Plasticity index"},
+        "ll": {"type": ["number", "null"], "description": "Liquid limit"},
+        "pl": {"type": ["number", "null"], "description": "Plastic limit"},
+        "source_citation": {"type": ["string", "null"], "description": "Source page and table or row"},
     },
     "required": ["pi", "ll", "pl", "source_citation"],
     "additionalProperties": False,
+}
+CONTRACT_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
+    ATTERBERG_LIMITS_TEMPLATE_KEY: (ATTERBERG_LIMITS_PROMPT, ATTERBERG_LIMITS_SCHEMA),
 }
 
 
@@ -158,9 +167,20 @@ class DocumentProcessorWindow(QMainWindow):
         prompt_layout = QVBoxLayout(prompt_group)
         mode_layout = QFormLayout()
         self.processing_mode_combo = QComboBox()
-        self.processing_mode_combo.addItem("Extracted text", ProcessingMode.TEXT)
+        self.processing_mode_combo.addItem("Extracted text (Not Recommended for PDF Processing)", ProcessingMode.TEXT)
         self.processing_mode_combo.addItem("PDF page images (vision model)", ProcessingMode.PDF_IMAGES)
         mode_layout.addRow("Document input", self.processing_mode_combo)
+        template_controls = QWidget()
+        template_layout = QHBoxLayout(template_controls)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        self.contract_template_combo = QComboBox()
+        self.contract_template_combo.addItem("Atterberg limits (PI, LL, PL)", ATTERBERG_LIMITS_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Custom (edit prompt and schema)", None)
+        template_layout.addWidget(self.contract_template_combo)
+        self.apply_template_button = QPushButton("Apply template")
+        self.apply_template_button.clicked.connect(self._apply_selected_template)
+        template_layout.addWidget(self.apply_template_button)
+        mode_layout.addRow("Extraction template", template_controls)
         prompt_layout.addLayout(mode_layout)
         prompt_layout.addWidget(QLabel("Task prompt (applied independently to every document)"))
         self.prompt_editor = QPlainTextEdit()
@@ -168,9 +188,10 @@ class DocumentProcessorWindow(QMainWindow):
         self.prompt_editor.setMinimumHeight(105)
         prompt_layout.addWidget(self.prompt_editor)
         prompt_layout.addWidget(QLabel("JSON output schema"))
-        self.schema_editor = QPlainTextEdit(json.dumps(DEFAULT_SCHEMA, indent=2))
+        self.schema_editor = QPlainTextEdit()
         self.schema_editor.setMinimumHeight(185)
         prompt_layout.addWidget(self.schema_editor)
+        self._apply_selected_template()
         layout.addWidget(prompt_group)
 
         provider_group = QGroupBox("3. Provider and API configuration")
@@ -207,6 +228,14 @@ class DocumentProcessorWindow(QMainWindow):
 
         layout.addStretch()
         return panel
+
+    def _apply_selected_template(self) -> None:
+        template_key = self.contract_template_combo.currentData()
+        if template_key is None:
+            return
+        prompt, schema = CONTRACT_TEMPLATES[template_key]
+        self.prompt_editor.setPlainText(prompt)
+        self.schema_editor.setPlainText(json.dumps(schema, indent=2))
 
     def _build_queue_panel(self) -> QWidget:
         panel = QGroupBox("4. Results queue")

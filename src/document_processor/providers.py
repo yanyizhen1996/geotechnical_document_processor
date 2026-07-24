@@ -111,7 +111,6 @@ class MicrosoftFoundryProvider(DocumentProvider):
         )
         return {
             "text": _extract_foundry_text(response),
-            "usage": _extract_usage(response),
         }
 
     def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -133,7 +132,6 @@ class MicrosoftFoundryProvider(DocumentProvider):
         )
         return {
             "text": _extract_foundry_text(response),
-            "usage": _extract_usage(response),
         }
 
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -314,11 +312,6 @@ def _extract_foundry_text(response: dict[str, Any]) -> str:
             if isinstance(message, dict) and isinstance(message.get("content"), str):
                 return message["content"]
     raise ProviderRequestError("Microsoft Foundry response did not include choices[0].message.content.")
-
-
-def _extract_usage(response: dict[str, Any]) -> dict[str, Any]:
-    usage = response.get("usage")
-    return usage if isinstance(usage, dict) else {}
 
 
 def _is_api_version_not_supported(detail: str) -> bool:
