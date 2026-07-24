@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import base64
 from dataclasses import dataclass
 import json
 from typing import Any
@@ -72,6 +73,10 @@ class DocumentProvider(ABC):
     def process_document(self, content: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         """Process one document only; no cross-document state is permitted."""
 
+    @abstractmethod
+    def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        """Process the rendered pages of one PDF only; no cross-document state is permitted."""
+
 
 class MicrosoftFoundryProvider(DocumentProvider):
     """Microsoft Foundry chat provider using a configured HTTPS endpoint and API key."""
@@ -121,6 +126,28 @@ class MicrosoftFoundryProvider(DocumentProvider):
         response = self._post_json(
             self._configuration.endpoint,
             _build_foundry_payload(self._configuration.endpoint, self._configuration.model_id, prompt, schema, content),
+        )
+        return {
+            "text": _extract_foundry_text(response),
+            "usage": _extract_usage(response),
+        }
+
+    def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if not self.readiness().ready:
+            raise ProviderNotReadyError(self.readiness().message)
+        if not page_images:
+            raise ProviderRequestError("The PDF did not produce any page images.")
+        assert self._configuration is not None
+
+        response = self._post_json(
+            self._configuration.endpoint,
+            _build_foundry_image_payload(
+                self._configuration.endpoint,
+                self._configuration.model_id,
+                prompt,
+                schema,
+                page_images,
+            ),
         )
         return {
             "text": _extract_foundry_text(response),
@@ -241,6 +268,45 @@ def _build_foundry_payload(endpoint: str, model_id: str, prompt: str, schema: di
         ],
     }
     # Deployment-style Azure OpenAI endpoints encode model/deployment in the URL.
+    if "/openai/deployments/" not in endpoint.lower():
+        payload["model"] = model_id
+    return payload
+
+
+def _build_foundry_image_payload(
+    endpoint: str,
+    model_id: str,
+    prompt: str,
+    schema: dict[str, Any],
+    page_images: tuple[bytes, ...],
+) -> dict[str, Any]:
+    """Build one vision request containing every rendered page for one PDF."""
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": _build_document_prompt(
+                prompt,
+                schema,
+                "The document is supplied as page images below. Use only those images.",
+            ),
+        }
+    ]
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{base64.b64encode(image).decode('ascii')}"},
+        }
+        for image in page_images
+    )
+    payload: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "system",
+                "content": "Use only the provided document content in this request. Do not rely on prior turns.",
+            },
+            {"role": "user", "content": content},
+        ],
+    }
     if "/openai/deployments/" not in endpoint.lower():
         payload["model"] = model_id
     return payload

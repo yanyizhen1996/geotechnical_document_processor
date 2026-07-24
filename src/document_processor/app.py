@@ -30,8 +30,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .domain import DocumentItem, DocumentStatus, ExtractionArtifact, ExtractionStatus, ProviderKind, inspect_document
-from .extraction import ExtractionError, extract_document
+from .domain import (
+    DocumentItem,
+    DocumentStatus,
+    ExtractionArtifact,
+    ExtractionStatus,
+    ProcessingMode,
+    ProviderKind,
+    inspect_document,
+)
+from .extraction import ExtractionError, extract_document, render_pdf_pages
 from .providers import (
     MicrosoftFoundryConfiguration,
     MicrosoftFoundryProvider,
@@ -134,6 +142,13 @@ class DocumentProcessorWindow(QMainWindow):
 
         prompt_group = QGroupBox("2. Task and output contract")
         prompt_layout = QVBoxLayout(prompt_group)
+        mode_layout = QFormLayout()
+        self.processing_mode_combo = QComboBox()
+        self.processing_mode_combo.addItem("Extracted text", ProcessingMode.TEXT)
+        self.processing_mode_combo.addItem("PDF page images (vision model)", ProcessingMode.PDF_IMAGES)
+        self.processing_mode_combo.currentIndexChanged.connect(self._update_estimate)
+        mode_layout.addRow("Document input", self.processing_mode_combo)
+        prompt_layout.addLayout(mode_layout)
         prompt_layout.addWidget(QLabel("Task prompt (applied independently to every document)"))
         self.prompt_editor = QPlainTextEdit()
         self.prompt_editor.setPlaceholderText("Example: Extract PI, LL, and PL values. Return the defined JSON object and cite the source page or row.")
@@ -296,6 +311,17 @@ class DocumentProcessorWindow(QMainWindow):
         if not any(item.is_ready for item in self._documents):
             QMessageBox.warning(self, "Documents required", "Add at least one supported document.")
             return False
+        mode = ProcessingMode(self.processing_mode_combo.currentData())
+        if mode is ProcessingMode.PDF_IMAGES:
+            non_pdf_documents = [item.path.name for item in self._documents if item.is_ready and item.extension != ".pdf"]
+            if non_pdf_documents:
+                QMessageBox.warning(
+                    self,
+                    "PDF images require PDF documents",
+                    "Image processing is available only for PDFs. Remove or switch the input mode for: "
+                    + ", ".join(non_pdf_documents),
+                )
+                return False
         try:
             schema = json.loads(self.schema_editor.toPlainText())
         except json.JSONDecodeError as error:
@@ -322,19 +348,23 @@ class DocumentProcessorWindow(QMainWindow):
         try:
             prompt = self.prompt_editor.toPlainText().strip()
             schema = json.loads(self.schema_editor.toPlainText())
+            mode = ProcessingMode(self.processing_mode_combo.currentData())
             results: list[dict[str, object]] = []
             for document in self._documents:
                 if not document.is_ready:
                     continue
-                artifact = self._artifacts.get(document.path)
-                if artifact is None:
-                    artifact = extract_document(document)
-                    self._artifacts[document.path] = artifact
-                if artifact.status is not ExtractionStatus.COMPLETE or not artifact.content.strip():
-                    results.append({"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings})
-                    continue
-                response = self._provider.process_document(artifact.content, prompt, schema)
-                results.append({"document": document.path.name, "status": "completed", **response})
+                if mode is ProcessingMode.PDF_IMAGES:
+                    response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, schema)
+                else:
+                    artifact = self._artifacts.get(document.path)
+                    if artifact is None:
+                        artifact = extract_document(document)
+                        self._artifacts[document.path] = artifact
+                    if artifact.status is not ExtractionStatus.COMPLETE or not artifact.content.strip():
+                        results.append({"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings})
+                        continue
+                    response = self._provider.process_document(artifact.content, prompt, schema)
+                results.append({"document": document.path.name, "input_mode": mode.value, "status": "completed", **response})
         except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
             self.batch_failed.emit(str(error))
             return

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+import pymupdf
 from docx import Document
 from openpyxl import load_workbook
 from pypdf import PdfReader
@@ -33,6 +34,24 @@ def extract_document(document: DocumentItem) -> ExtractionArtifact:
         return extractors[document.extension](document)
     except (OSError, PdfReadError, ValueError) as error:
         raise ExtractionError(f"Could not read '{document.path.name}': {error}") from error
+
+
+def render_pdf_pages(document: DocumentItem) -> tuple[bytes, ...]:
+    """Render every page of a ready PDF to in-memory PNG bytes."""
+    if not document.is_ready:
+        raise ExtractionError(f"Cannot render a document with status '{document.status.value}'.")
+    if document.extension != ".pdf":
+        raise ExtractionError("Image processing is available only for PDF documents.")
+
+    try:
+        with pymupdf.open(document.path) as source:
+            pages = tuple(page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False).tobytes("png") for page in source)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ExtractionError(f"Could not render '{document.path.name}': {error}") from error
+
+    if not pages:
+        raise ExtractionError(f"Could not render '{document.path.name}': the PDF has no pages.")
+    return pages
 
 
 def _extract_csv(document: DocumentItem) -> ExtractionArtifact:

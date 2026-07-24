@@ -5,7 +5,7 @@ from openpyxl import Workbook
 from pypdf import PdfWriter
 
 from document_processor.domain import DocumentStatus, ExtractionStatus, inspect_document
-from document_processor.extraction import ExtractionError, extract_document
+from document_processor.extraction import ExtractionError, extract_document, render_pdf_pages
 
 
 def test_extract_csv_includes_rows_and_provenance(tmp_path: Path) -> None:
@@ -61,6 +61,20 @@ def test_extract_blank_pdf_requires_review_for_local_ocr(tmp_path: Path) -> None
 
     assert artifact.status is ExtractionStatus.REVIEW_REQUIRED
     assert "OCR" in artifact.warnings[0]
+
+
+def test_render_pdf_pages_returns_a_png_for_each_page(tmp_path: Path) -> None:
+    path = tmp_path / "scan.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    with path.open("wb") as target:
+        writer.write(target)
+
+    pages = render_pdf_pages(inspect_document(path))
+
+    assert len(pages) == 2
+    assert all(page.startswith(b"\x89PNG\r\n\x1a\n") for page in pages)
 
 
 def test_extract_legacy_doc_reports_configured_limitation(tmp_path: Path) -> None:

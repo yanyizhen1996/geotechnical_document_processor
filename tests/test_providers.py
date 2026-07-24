@@ -8,6 +8,7 @@ from document_processor.providers import (
     ProviderRequestError,
     _is_api_version_not_supported,
     _is_deployment_not_found,
+    _build_foundry_image_payload,
     _build_foundry_payload,
     _normalize_foundry_endpoint,
 )
@@ -64,6 +65,35 @@ def test_microsoft_foundry_sends_configured_request_payload(monkeypatch: pytest.
     assert payload["messages"][1]["role"] == "user"
     assert "Extract PI" in payload["messages"][1]["content"]
     assert "document-only content" in payload["messages"][1]["content"]
+
+
+def test_microsoft_foundry_sends_one_multimodal_request_per_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = MicrosoftFoundryProvider(
+        MicrosoftFoundryConfiguration(
+            endpoint="https://example.foundry.microsoft.com/chat/completions?api-version=2024-05-01-preview",
+            api_key="test-key",
+            model_id="gpt-4.1-mini",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_post(endpoint: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((endpoint, payload))
+        return {"choices": [{"message": {"content": '{"pi": 12}'}}]}
+
+    monkeypatch.setattr(provider, "_post_json", fake_post)
+
+    result = provider.process_pdf_images((b"page-one", b"page-two"), "Extract PI", {"type": "object"})
+
+    assert result["text"] == '{"pi": 12}'
+    assert len(calls) == 1
+    content = calls[0][1]["messages"][1]["content"]
+    assert content[0]["type"] == "text"
+    assert "Extract PI" in content[0]["text"]
+    assert [item["image_url"]["url"] for item in content[1:]] == [
+        "data:image/png;base64,cGFnZS1vbmU=",
+        "data:image/png;base64,cGFnZS10d28=",
+    ]
 
 
 def test_microsoft_foundry_rejects_oversized_context() -> None:
@@ -146,3 +176,16 @@ def test_build_payload_omits_model_for_deployment_style_endpoints() -> None:
 
     assert "model" not in payload
     assert payload["messages"][1]["role"] == "user"
+
+
+def test_build_image_payload_omits_model_for_deployment_style_endpoints() -> None:
+    payload = _build_foundry_image_payload(
+        "https://example.openai.azure.com/openai/deployments/my-deployment/chat/completions?api-version=2024-02-01",
+        "ignored-model-id",
+        "Extract PI",
+        {"type": "object"},
+        (b"page",),
+    )
+
+    assert "model" not in payload
+    assert payload["messages"][1]["content"][1]["type"] == "image_url"

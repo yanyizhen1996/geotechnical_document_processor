@@ -4,9 +4,9 @@ A Windows desktop application for safely processing large document sets one docu
 
 ## Initial implementation
 
-This first vertical slice provides a PySide6 GUI shell with document selection and local preflight for PDF, CSV, XLSX, DOCX, and DOC files; task-prompt and JSON output-contract editors; Microsoft Foundry as the default profile; a policy-gated OpenAI profile; a local request/quota estimate; and a results queue with timestamped JSON output files.
+This first vertical slice provides a PySide6 GUI shell with document selection and local preflight for PDF, CSV, XLSX, DOCX, and DOC files; task-prompt and JSON output-contract editors; a selectable text or PDF-image input mode; Microsoft Foundry as the default profile; a policy-gated OpenAI profile; a local request/quota estimate; and a results queue with timestamped JSON output files.
 
-Preflight extracts CSV, XLSX, DOCX, and text-based PDF content locally, retaining page, sheet/row, or paragraph/table provenance in memory. Image-only PDFs are marked for locally configured OCR. Legacy DOC files are detected but remain unavailable until an approved local conversion path is configured.
+Text mode extracts CSV, XLSX, DOCX, and text-based PDF content locally, retaining page, sheet/row, or paragraph/table provenance in memory. Image-only PDFs are marked for locally configured OCR in this mode. PDF-image mode renders every page of each PDF into an in-memory PNG and sends those page images in one isolated vision request for that document; it is not available for CSV, XLSX, DOCX, or DOC files. Legacy DOC files are detected but remain unavailable until an approved local conversion path is configured.
 
 It provides core domain, provider, and SQLite repository scaffolding. Foundry credentials stay in memory for the running session and are not written to disk.
 
@@ -26,12 +26,13 @@ Microsoft Foundry is the intended primary provider. OpenAI is an explicit, separ
 The app uses a synchronous chat-completions style request against your configured Foundry endpoint:
 
 1. Configure endpoint URL, API key, and model ID in the GUI.
-2. For each document, build one independent request with:
+2. Select the input mode. Use **Extracted text** for all supported document types, or **PDF page images** for PDFs that need visual processing.
+3. For each document, build one independent request with:
 	- a system instruction to stay document-bound
-	- one user message containing task, schema, and that document's extracted content
-3. Submit the request to the configured endpoint with the `api-key` header.
-4. Parse `choices[0].message.content` as the model response.
-5. Display results in the GUI and write a timestamped JSON file under `outputs/`.
+	- one user message containing task, schema, and that document's extracted content or rendered page images
+4. Submit the request to the configured endpoint with the `api-key` header. PDF-image mode requires a configured model/deployment that accepts image inputs.
+5. Parse `choices[0].message.content` as the model response.
+6. Display results in the GUI and write a timestamped JSON file under `outputs/`.
 
 The initial integration limits each extracted document context to 100,000 characters to avoid long-running requests; document-local chunking will be added later.
 

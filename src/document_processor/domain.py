@@ -13,6 +13,11 @@ class ProviderKind(StrEnum):
     OPENAI = "openai"
 
 
+class ProcessingMode(StrEnum):
+    TEXT = "text"
+    PDF_IMAGES = "pdf_images"
+
+
 class DocumentStatus(StrEnum):
     READY = "ready"
     EXCLUDED = "excluded"
