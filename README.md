@@ -16,7 +16,7 @@ Before enabling processing, confirm with the platform administrator:
 
 1. The approved Microsoft Foundry model endpoint URL.
 2. A valid API key for that endpoint.
-3. The model ID/deployment name expected by the endpoint.
+3. A supported model name: `gpt-5-mini` or `gpt-5.4-mini`.
 4. Data-handling policy, concurrency/rate limits, and quota telemetry approach.
 
 Microsoft Foundry is the intended primary provider. OpenAI is an explicit, separate provider option; it must not be used as an automatic fallback.
@@ -25,7 +25,7 @@ Microsoft Foundry is the intended primary provider. OpenAI is an explicit, separ
 
 The app uses a synchronous chat-completions style request against your configured Foundry endpoint:
 
-1. Configure endpoint URL, API key, and model ID in the GUI.
+1. Configure endpoint URL, API key, and model name in the GUI.
 2. Select the input mode. Use **Extracted text** for non-PDF documents, or **PDF page images** for PDFs that need visual processing.
 3. Select an extraction template. **Soil laboratory summary** is the default and populates an editable output structure containing the reported test type and one entry per tested sample with borehole, sample ID, depth, and final result values. Select **Custom** to edit either field without overwriting it.
 4. For each document, build one independent request with:
@@ -33,7 +33,11 @@ The app uses a synchronous chat-completions style request against your configure
 	- one user message containing task instructions, output structure, and that document's extracted content or rendered page images
 5. Submit the request to the configured endpoint with the `api-key` header. PDF-image mode requires a configured model/deployment that accepts image inputs.
 6. Parse `choices[0].message.content` as the model response.
-7. Display results in the GUI and write timestamped JSON and long-format CSV files under `outputs/`. The CSV contains one row per reported test result, repeating its document, test, and sample context.
+7. Display results and live batch input, cached input, output, total token counts, and estimated cost in the GUI. Write timestamped JSON and long-format CSV files under `outputs/`; token telemetry and cost estimates are not persisted. The CSV contains one row per reported test result, repeating its document, test, and sample context.
+
+## Live Cost Estimates
+
+The results queue estimates each completed batch from the returned token counts and the selected model's USD price per one million tokens. The configured rates are `gpt-5-mini`: input `$0.28`, cached input `$0.03`, output `$2.20`; and `gpt-5.4-mini`: input `$0.83`, cached input `$0.09`, output `$4.95`. These estimates are shown only for the current application session.
 
 The initial integration limits each extracted document context to 100,000 characters to avoid long-running requests; document-local chunking will be added later.
 

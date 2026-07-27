@@ -96,12 +96,16 @@ SOIL_LAB_SUMMARY_STRUCTURE = {
 EXTRACTION_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
     SOIL_LAB_SUMMARY_TEMPLATE_KEY: (SOIL_LAB_SUMMARY_PROMPT, SOIL_LAB_SUMMARY_STRUCTURE),
 }
+MODEL_PRICING_PER_MILLION_TOKENS = {
+    "gpt-5-mini": {"input": 0.28, "cached_input": 0.03, "output": 2.20},
+    "gpt-5.4-mini": {"input": 0.83, "cached_input": 0.09, "output": 4.95},
+}
 
 
 class DocumentProcessorWindow(QMainWindow):
     """Desktop batch UI using Microsoft Foundry endpoint credentials."""
 
-    batch_completed = Signal(str)
+    batch_completed = Signal(str, int, int, int, str)
     batch_failed = Signal(str)
 
     def __init__(self) -> None:
@@ -236,10 +240,11 @@ class DocumentProcessorWindow(QMainWindow):
         self.endpoint_input.setPlaceholderText("https://<resource>/.../chat/completions?... ")
         self.endpoint_input.textChanged.connect(self._refresh_provider_state)
         provider_layout.addRow("Endpoint", self.endpoint_input)
-        self.model_id_input = QLineEdit()
-        self.model_id_input.setPlaceholderText("Model ID")
-        self.model_id_input.textChanged.connect(self._refresh_provider_state)
-        provider_layout.addRow("Model ID", self.model_id_input)
+        self.model_name_combo = QComboBox()
+        self.model_name_combo.addItem("gpt-5-mini")
+        self.model_name_combo.addItem("gpt-5.4-mini")
+        self.model_name_combo.currentIndexChanged.connect(self._refresh_provider_state)
+        provider_layout.addRow("Model name", self.model_name_combo)
         self.api_version_input = QLineEdit()
         self.api_version_input.setPlaceholderText("Optional, e.g. 2025-04-01-preview")
         self.api_version_input.textChanged.connect(self._refresh_provider_state)
@@ -249,7 +254,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.api_key_input.setPlaceholderText("API key")
         self.api_key_input.textChanged.connect(self._refresh_provider_state)
         provider_layout.addRow("API key", self.api_key_input)
-        self.provider_note = QLabel("API key, endpoint, and model ID are used in memory for this session and are not written to disk.")
+        self.provider_note = QLabel("API key, endpoint, and model name are used in memory for this session and are not written to disk.")
         self.provider_note.setWordWrap(True)
         provider_layout.addRow("Configuration", self.provider_note)
         layout.addWidget(provider_group)
@@ -277,10 +282,12 @@ class DocumentProcessorWindow(QMainWindow):
         actions.addWidget(validate_button)
         self.process_button = QPushButton("Process batch")
         self.process_button.setEnabled(False)
-        self.process_button.setToolTip("Provide endpoint, model ID, and API key before processing.")
+        self.process_button.setToolTip("Provide endpoint, model name, and API key before processing.")
         self.process_button.clicked.connect(self._start_batch)
         actions.addWidget(self.process_button)
         layout.addLayout(actions)
+        self.token_usage_label = QLabel("Batch token usage and estimated cost will appear after processing.")
+        layout.addWidget(self.token_usage_label)
         self.results_editor = QPlainTextEdit()
         self.results_editor.setReadOnly(True)
         self.results_editor.setPlaceholderText("Completed batch results will appear here and be saved as JSON and CSV files.")
@@ -351,7 +358,7 @@ class DocumentProcessorWindow(QMainWindow):
             MicrosoftFoundryConfiguration(
                 endpoint=self.endpoint_input.text().strip(),
                 api_key=self.api_key_input.text().strip(),
-                model_id=self.model_id_input.text().strip(),
+                model_id=self.model_name_combo.currentText(),
                 api_version=self.api_version_input.text().strip(),
             )
         )
@@ -398,6 +405,7 @@ class DocumentProcessorWindow(QMainWindow):
             return
         self.process_button.setEnabled(False)
         self.queue_status.setText("Processing each document in an independent Microsoft Foundry request…")
+        self.token_usage_label.setText("Calculating batch token usage…")
         threading.Thread(target=self._run_batch, daemon=True).start()
 
     def _run_batch(self) -> None:
@@ -406,6 +414,9 @@ class DocumentProcessorWindow(QMainWindow):
             output_structure = json.loads(self.output_structure_editor.toPlainText())
             mode = ProcessingMode(self.processing_mode_combo.currentData())
             results: list[dict[str, object]] = []
+            prompt_tokens = 0
+            completion_tokens = 0
+            cached_prompt_tokens = 0
             for document in self._documents:
                 if not document.is_ready:
                     continue
@@ -420,14 +431,37 @@ class DocumentProcessorWindow(QMainWindow):
                         results.append({"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings})
                         continue
                     response = self._provider.process_document(artifact.content, prompt, output_structure)
+                usage = response.pop("usage", {})
+                prompt_tokens += _token_count(usage, "prompt_tokens")
+                completion_tokens += _token_count(usage, "completion_tokens")
+                cached_prompt_tokens += _cached_token_count(usage)
                 results.append({"document": document.path.name, "input_mode": mode.value, "status": "completed", **response})
         except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
             self.batch_failed.emit(str(error))
             return
-        self.batch_completed.emit(json.dumps(results, indent=2, ensure_ascii=False))
+        self.batch_completed.emit(
+            json.dumps(results, indent=2, ensure_ascii=False),
+            prompt_tokens,
+            cached_prompt_tokens,
+            completion_tokens,
+            self.model_name_combo.currentText(),
+        )
 
-    def _on_batch_completed(self, results: str) -> None:
+    def _on_batch_completed(
+        self,
+        results: str,
+        prompt_tokens: int,
+        cached_prompt_tokens: int,
+        completion_tokens: int,
+        model_name: str,
+    ) -> None:
         self.results_editor.setPlainText(results)
+        estimated_cost = _calculate_batch_cost(model_name, prompt_tokens, cached_prompt_tokens, completion_tokens)
+        self.token_usage_label.setText(
+            f"Batch token usage: input {prompt_tokens:,} | cached input {cached_prompt_tokens:,} | "
+            f"output {completion_tokens:,} | total {prompt_tokens + completion_tokens:,} | "
+            f"estimated cost ${estimated_cost:.6f}"
+        )
         try:
             output_path = _write_results_file(results)
             csv_output_path = _write_csv_file(results, output_path)
@@ -439,6 +473,7 @@ class DocumentProcessorWindow(QMainWindow):
 
     def _on_batch_failed(self, error: str) -> None:
         self.queue_status.setText("Batch failed. No provider response was written to disk.")
+        self.token_usage_label.setText("Batch token usage unavailable because processing did not complete.")
         self._refresh_provider_state()
         QMessageBox.warning(self, "Batch processing failed", error)
 
@@ -457,6 +492,31 @@ def _write_results_file(results: str, output_dir: Path | None = None) -> Path:
     output_path = directory / f"document_processor_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     output_path.write_text(results, encoding="utf-8")
     return output_path
+
+
+def _token_count(usage: object, field_name: str) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    value = usage.get(field_name)
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _cached_token_count(usage: object) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    return _token_count(usage.get("prompt_tokens_details"), "cached_tokens")
+
+
+def _calculate_batch_cost(model_name: str, prompt_tokens: int, cached_prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimate batch cost from returned token counts and the selected model's USD rates per million tokens."""
+    pricing = MODEL_PRICING_PER_MILLION_TOKENS[model_name]
+    cached_tokens = min(cached_prompt_tokens, prompt_tokens)
+    uncached_prompt_tokens = prompt_tokens - cached_tokens
+    return (
+        (uncached_prompt_tokens * pricing["input"])
+        + (cached_tokens * pricing["cached_input"])
+        + (completion_tokens * pricing["output"])
+    ) / 1_000_000
 
 
 CSV_FIELDNAMES = (

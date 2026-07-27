@@ -79,9 +79,9 @@ class MicrosoftFoundryProvider(DocumentProvider):
 
     def readiness(self) -> ProviderReadiness:
         if self._configuration is None:
-            message = "Enter the Microsoft Foundry endpoint URL, API key, and model ID."
+            message = "Enter the Microsoft Foundry endpoint URL, API key, and model name."
         elif not self._configuration.endpoint.strip() or not self._configuration.api_key.strip() or not self._configuration.model_id.strip():
-            message = "Endpoint URL, API key, and model ID are all required."
+            message = "Endpoint URL, API key, and model name are all required."
         elif not self._configuration.endpoint.strip().lower().startswith("https://"):
             message = "Endpoint must be an HTTPS URL."
         else:
@@ -111,6 +111,7 @@ class MicrosoftFoundryProvider(DocumentProvider):
         )
         return {
             "text": _extract_foundry_text(response),
+            "usage": _extract_usage(response),
         }
 
     def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -132,6 +133,7 @@ class MicrosoftFoundryProvider(DocumentProvider):
         )
         return {
             "text": _extract_foundry_text(response),
+            "usage": _extract_usage(response),
         }
 
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -156,7 +158,7 @@ class MicrosoftFoundryProvider(DocumentProvider):
                 raise ProviderRequestError(
                     "Microsoft Foundry could not find the configured deployment/model. "
                     f"Resolved endpoint: {normalized_endpoint}. "
-                    f"Configured Model ID: {self._configuration.model_id}. "
+                    f"Configured model name: {self._configuration.model_id}. "
                     "In Foundry, this field must be the exact deployment name available to this project/resource, "
                     "not the project name, endpoint name, or generic model family name unless that is also the deployment name. "
                     "If you just created the deployment, wait a few minutes and retry. "
@@ -312,6 +314,11 @@ def _extract_foundry_text(response: dict[str, Any]) -> str:
             if isinstance(message, dict) and isinstance(message.get("content"), str):
                 return message["content"]
     raise ProviderRequestError("Microsoft Foundry response did not include choices[0].message.content.")
+
+
+def _extract_usage(response: dict[str, Any]) -> dict[str, Any]:
+    usage = response.get("usage")
+    return usage if isinstance(usage, dict) else {}
 
 
 def _is_api_version_not_supported(detail: str) -> bool:

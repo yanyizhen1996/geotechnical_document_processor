@@ -4,8 +4,15 @@ from types import SimpleNamespace
 
 from pypdf import PdfWriter
 from PySide6.QtWidgets import QApplication, QGroupBox, QScrollArea
+import pytest
 
-from document_processor.app import SOIL_LAB_SUMMARY_PROMPT, DocumentProcessorWindow, _write_csv_file, _write_results_file
+from document_processor.app import (
+    SOIL_LAB_SUMMARY_PROMPT,
+    DocumentProcessorWindow,
+    _calculate_batch_cost,
+    _write_csv_file,
+    _write_results_file,
+)
 from document_processor.domain import ProcessingMode, inspect_document
 
 
@@ -92,6 +99,10 @@ def test_window_layout_supports_compact_resizing() -> None:
     assert isinstance(window.output_structure_editor.parentWidget(), QGroupBox)
     assert "Batch estimate" not in [group.title() for group in window.findChildren(QGroupBox)]
     assert window.processing_mode_combo.currentData() == ProcessingMode.PDF_IMAGES
+    assert [window.model_name_combo.itemText(index) for index in range(window.model_name_combo.count())] == [
+        "gpt-5-mini",
+        "gpt-5.4-mini",
+    ]
 
     window.close()
 
@@ -126,6 +137,12 @@ def test_soil_lab_summary_template_populates_a_compact_output_structure() -> Non
     window.close()
 
 
+def test_calculate_batch_cost_uses_cached_input_pricing() -> None:
+    cost = _calculate_batch_cost("gpt-5.4-mini", prompt_tokens=200, cached_prompt_tokens=100, completion_tokens=50)
+
+    assert cost == pytest.approx(0.0003395)
+
+
 def test_image_mode_renders_a_pdf_and_uses_the_image_provider(tmp_path) -> None:
     path = tmp_path / "scan.pdf"
     writer = PdfWriter()
@@ -149,11 +166,22 @@ def test_image_mode_renders_a_pdf_and_uses_the_image_provider(tmp_path) -> None:
 
         def process_pdf_images(self, pages: tuple[bytes, ...], prompt: str, schema: dict[str, object]) -> dict[str, object]:
             calls.append((pages, prompt, schema))
-            return {"text": "{}"}
+            return {
+                "text": "{}",
+                "usage": {
+                    "prompt_tokens": 200,
+                    "prompt_tokens_details": {"cached_tokens": 100},
+                    "completion_tokens": 50,
+                },
+            }
 
     window._provider = ImageProvider()
-    results: list[str] = []
-    window.batch_completed.connect(results.append)
+    results: list[tuple[str, int, int, int, str]] = []
+    window.batch_completed.connect(
+        lambda result_text, prompt_tokens, cached_prompt_tokens, completion_tokens, model_name: results.append(
+            (result_text, prompt_tokens, cached_prompt_tokens, completion_tokens, model_name)
+        )
+    )
 
     window._run_batch()
 
@@ -161,6 +189,10 @@ def test_image_mode_renders_a_pdf_and_uses_the_image_provider(tmp_path) -> None:
     assert len(calls) == 1
     assert calls[0][0][0].startswith(b"\x89PNG\r\n\x1a\n")
     assert calls[0][1] == "Extract values"
-    result = json.loads(results[0])[0]
+    result = json.loads(results[0][0])[0]
     assert result["input_mode"] == ProcessingMode.PDF_IMAGES
     assert "usage" not in result
+    assert results[0][1:] == (200, 100, 50, "gpt-5-mini")
+    assert window.token_usage_label.text() == (
+        "Batch token usage: input 200 | cached input 100 | output 50 | total 250 | estimated cost $0.000141"
+    )
