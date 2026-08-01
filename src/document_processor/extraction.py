@@ -18,6 +18,10 @@ class ExtractionError(RuntimeError):
     """The selected document cannot be extracted locally."""
 
 
+# Rasterization scale for PDF page images; higher improves fine-print (e.g. depth ticks) legibility at higher token cost.
+PDF_RENDER_SCALE = 2.5
+
+
 def extract_document(document: DocumentItem) -> ExtractionArtifact:
     """Read one supported document into a bounded, provenance-labelled artifact."""
     if not document.is_ready:
@@ -45,7 +49,7 @@ def render_pdf_pages(document: DocumentItem) -> tuple[bytes, ...]:
 
     try:
         with pymupdf.open(document.path) as source:
-            pages = tuple(page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False).tobytes("png") for page in source)
+            pages = tuple(page.get_pixmap(matrix=pymupdf.Matrix(PDF_RENDER_SCALE, PDF_RENDER_SCALE), alpha=False).tobytes("png") for page in source)
     except (OSError, RuntimeError, ValueError) as error:
         raise ExtractionError(f"Could not render '{document.path.name}': {error}") from error
 

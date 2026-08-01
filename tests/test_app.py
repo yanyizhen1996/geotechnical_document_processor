@@ -3,14 +3,19 @@ import json
 from types import SimpleNamespace
 
 from pypdf import PdfWriter
+from PySide6.QtCore import Qt, QMimeData, QPointF, QUrl
+from PySide6.QtGui import QDropEvent
 from PySide6.QtWidgets import QApplication, QGroupBox, QScrollArea
 import pytest
 
 from document_processor.app import (
     SOIL_LAB_SUMMARY_PROMPT,
+    BOREHOLE_LOG_PROMPT,
+    DocumentDropGroupBox,
     DocumentProcessorWindow,
     _calculate_batch_cost,
     _write_csv_file,
+    _write_csv_outputs,
     _write_results_file,
 )
 from document_processor.domain import ProcessingMode, inspect_document
@@ -102,6 +107,7 @@ def test_window_layout_supports_compact_resizing() -> None:
     assert [window.model_name_combo.itemText(index) for index in range(window.model_name_combo.count())] == [
         "gpt-5-mini",
         "gpt-5.4-mini",
+        "gpt-5.6-luna",
     ]
 
     window.close()
@@ -124,7 +130,7 @@ def test_soil_lab_summary_template_populates_a_compact_output_structure() -> Non
         "value": {"type": ["string", "null"]},
         "unit": {"type": ["string", "null"]},
     }
-    assert window.contract_template_combo.count() == 2
+    assert window.contract_template_combo.count() == 3
 
     window.prompt_editor.setPlainText("Keep this custom prompt")
     window.output_structure_editor.setPlainText('{"type": "object"}')
@@ -134,6 +140,138 @@ def test_soil_lab_summary_template_populates_a_compact_output_structure() -> Non
     assert application is not None
     assert window.prompt_editor.toPlainText() == "Keep this custom prompt"
     assert window.output_structure_editor.toPlainText() == '{"type": "object"}'
+    window.close()
+
+
+def test_borehole_log_template_populates_structure() -> None:
+    application = QApplication.instance() or QApplication([])
+    window = DocumentProcessorWindow()
+
+    window.contract_template_combo.setCurrentIndex(window.contract_template_combo.findData("borehole_log"))
+    window.apply_template_button.click()
+
+    assert application is not None
+    assert window.prompt_editor.toPlainText() == BOREHOLE_LOG_PROMPT
+    output_structure = json.loads(window.output_structure_editor.toPlainText())
+    assert output_structure["required"] == ["borehole_id", "surface_elevation", "depth_unit", "samples", "soil_descriptions"]
+    sample_structure = output_structure["properties"]["samples"]["items"]
+    assert sample_structure["required"] == ["sample_id", "top_depth", "bottom_depth", "blow_count"]
+    assert sample_structure["properties"]["blow_count"]["type"] == ["string", "null"]
+    soil_structure = output_structure["properties"]["soil_descriptions"]["items"]
+    assert soil_structure["required"] == ["top_depth", "bottom_depth", "description"]
+    window.close()
+
+
+def test_write_csv_outputs_splits_borehole_samples_and_soil_descriptions(tmp_path) -> None:
+    results = json.dumps(
+        [
+            {
+                "document": "log.pdf",
+                "input_mode": "pdf_images",
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "borehole_id": "PB-13",
+                        "surface_elevation": "512.3 ft",
+                        "depth_unit": "ft",
+                        "samples": [
+                            {
+                                "sample_id": "S-1",
+                                "top_depth": "5",
+                                "bottom_depth": "6.5",
+                                "blow_count": "8 8 9",
+                            },
+                            {
+                                "sample_id": "S-2",
+                                "top_depth": "10",
+                                "bottom_depth": "11.5",
+                                "blow_count": "18",
+                            },
+                        ],
+                        "soil_descriptions": [
+                            {"top_depth": "0", "bottom_depth": "4", "description": "Brown silty CLAY"},
+                        ],
+                    }
+                ),
+            }
+        ]
+    )
+    json_output_path = _write_results_file(results, tmp_path)
+
+    csv_paths = _write_csv_outputs(results, json_output_path)
+
+    samples_path = json_output_path.with_name(f"{json_output_path.stem}_samples.csv")
+    soil_path = json_output_path.with_name(f"{json_output_path.stem}_soil_descriptions.csv")
+    assert csv_paths == (samples_path, soil_path)
+    with samples_path.open(encoding="utf-8-sig", newline="") as source:
+        sample_rows = list(csv.DictReader(source))
+    with soil_path.open(encoding="utf-8-sig", newline="") as source:
+        soil_rows = list(csv.DictReader(source))
+    assert sample_rows == [
+        {
+            "document": "log.pdf",
+            "input_mode": "pdf_images",
+            "status": "completed",
+            "borehole_id": "PB-13",
+            "surface_elevation": "512.3 ft",
+            "depth_unit": "ft",
+            "sample_id": "S-1",
+            "top_depth": "5",
+            "bottom_depth": "6.5",
+            "blow_count": "8 8 9",
+        },
+        {
+            "document": "log.pdf",
+            "input_mode": "pdf_images",
+            "status": "completed",
+            "borehole_id": "PB-13",
+            "surface_elevation": "512.3 ft",
+            "depth_unit": "ft",
+            "sample_id": "S-2",
+            "top_depth": "10",
+            "bottom_depth": "11.5",
+            "blow_count": "18",
+        },
+    ]
+    assert soil_rows == [
+        {
+            "document": "log.pdf",
+            "input_mode": "pdf_images",
+            "status": "completed",
+            "borehole_id": "PB-13",
+            "surface_elevation": "512.3 ft",
+            "depth_unit": "ft",
+            "top_depth": "0",
+            "bottom_depth": "4",
+            "description": "Brown silty CLAY",
+        },
+    ]
+
+
+def test_drag_and_drop_adds_documents(tmp_path) -> None:
+    path = tmp_path / "dropped.csv"
+    path.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    application = QApplication.instance() or QApplication([])
+    window = DocumentProcessorWindow()
+    drop_box = window.findChild(DocumentDropGroupBox)
+    assert drop_box is not None
+    assert drop_box.acceptDrops() is True
+
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(path))])
+    event = QDropEvent(
+        QPointF(1, 1),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    drop_box.dropEvent(event)
+
+    assert application is not None
+    assert [item.path.name for item in window._documents] == ["dropped.csv"]
+    assert window.document_table.rowCount() == 1
     window.close()
 
 

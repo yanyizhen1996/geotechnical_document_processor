@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -54,7 +55,9 @@ SOIL_LAB_SUMMARY_PROMPT = (
     "Review the soil laboratory report and extract only the information needed for a geotechnical laboratory "
     "summary table. Set test_type to the reported laboratory test or standard. Add one samples item for each "
     "tested sample, with its borehole or sample location, sample ID, depth, and only its final reportable test "
-    "results. Include classification only when it is reported as a final test result. Do not extract client, "
+    "results. Borehole or sample locations are typically labelled with a 'B', such as 'B-13' or 'PB-13', while "
+    "sample IDs typically contain an 'S'; use these conventions to assign each identifier to the correct field. "
+    "Include classification only when it is reported as a final test result. Do not extract client, "
     "project details, report dates, personnel, intermediate weights, calculations, narrative summaries, or other "
     "metadata. Preserve reported values and units. Use null for unavailable sample identifiers and an empty results "
     "list only when a tested sample has no reportable final results."
@@ -93,13 +96,105 @@ SOIL_LAB_SUMMARY_STRUCTURE = {
     "required": ["test_type", "samples"],
     "additionalProperties": False,
 }
+BOREHOLE_LOG_TEMPLATE_KEY = "borehole_log"
+BOREHOLE_LOG_PROMPT = (
+    "Digitize this borehole log page into structured data. Set borehole_id to the borehole identifier that labels "
+    "the log; borehole identifiers are typically labelled with a 'B', such as 'B-13' or 'PB-13'. This identifier "
+    "applies to the whole page. Set surface_elevation to the reported ground surface elevation exactly as written, or "
+    "null when none is shown. Determine the single depth unit used on the log (for example 'ft' or 'm') and set "
+    "depth_unit to it; record every top_depth and bottom_depth as a plain number in that unit, with no unit suffix. "
+    "Depths are shown on a vertical depth scale along the left edge and are usually not printed for each interval, so "
+    "read each interval's top and bottom by aligning the edges of its sample marker or material-graphics band to that "
+    "scale, using the numbered foot marks and their minor tick subdivisions to interpolate as precisely as you can. A "
+    "sample interval is the vertical extent of its marker in the sample-location column; a soil stratum is the vertical "
+    "extent of its band in the material-graphics or description column. Ensure top_depth is less than bottom_depth for "
+    "each interval. Add one samples item for each sampled interval, with its sample_id and the top_depth and "
+    "bottom_depth of its interval. Sample IDs typically contain an 'S', such as 'S-4'. Set blow_count to the reported "
+    "blow count as text: when the log shows raw per-increment drive counts, join them with single spaces (for example "
+    "'8 8 9'); when the log shows a single number, use it as written; set blow_count to null when a sample has no blow "
+    "count. Add one soil_descriptions item for each described stratum, with its top_depth, bottom_depth, and "
+    "description text; strata boundaries are independent of the sample intervals. Preserve reported values exactly, "
+    "other than normalizing depths as described. Do not extract client, project, contractor, dates, personnel, "
+    "equipment, drilling method, water levels, narrative notes, or other metadata unless it is one of the fields "
+    "above. Use null for any unavailable field and an empty list only when the log has no samples or no soil "
+    "descriptions."
+)
+BOREHOLE_LOG_STRUCTURE = {
+    "type": "object",
+    "properties": {
+        "borehole_id": {"type": ["string", "null"], "description": "Borehole identifier for the whole page; typically contains 'B'"},
+        "surface_elevation": {"type": ["string", "null"], "description": "Reported ground surface elevation, as written"},
+        "depth_unit": {"type": ["string", "null"], "description": "Single depth unit used across the log, e.g. 'ft' or 'm'"},
+        "samples": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "sample_id": {"type": ["string", "null"], "description": "Sample identifier; typically contains 'S'"},
+                    "top_depth": {"type": ["string", "null"], "description": "Top of the sample interval as a plain number in depth_unit, no unit suffix"},
+                    "bottom_depth": {"type": ["string", "null"], "description": "Bottom of the sample interval as a plain number in depth_unit, no unit suffix"},
+                    "blow_count": {"type": ["string", "null"], "description": "Reported blow count as text: space-separated raw drives like '8 8 9', or a single value; null if none"},
+                },
+                "required": ["sample_id", "top_depth", "bottom_depth", "blow_count"],
+                "additionalProperties": False,
+            },
+        },
+        "soil_descriptions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "top_depth": {"type": ["string", "null"], "description": "Top of the described stratum as a plain number in depth_unit, no unit suffix"},
+                    "bottom_depth": {"type": ["string", "null"], "description": "Bottom of the described stratum as a plain number in depth_unit, no unit suffix"},
+                    "description": {"type": ["string", "null"], "description": "Soil or material description for the interval"},
+                },
+                "required": ["top_depth", "bottom_depth", "description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["borehole_id", "surface_elevation", "depth_unit", "samples", "soil_descriptions"],
+    "additionalProperties": False,
+}
 EXTRACTION_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
     SOIL_LAB_SUMMARY_TEMPLATE_KEY: (SOIL_LAB_SUMMARY_PROMPT, SOIL_LAB_SUMMARY_STRUCTURE),
+    BOREHOLE_LOG_TEMPLATE_KEY: (BOREHOLE_LOG_PROMPT, BOREHOLE_LOG_STRUCTURE),
 }
 MODEL_PRICING_PER_MILLION_TOKENS = {
     "gpt-5-mini": {"input": 0.28, "cached_input": 0.03, "output": 2.20},
     "gpt-5.4-mini": {"input": 0.83, "cached_input": 0.09, "output": 4.95},
+    "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "output": 6.00},
 }
+
+
+class DocumentDropGroupBox(QGroupBox):
+    """Group box that accepts external file drops and reports their local paths."""
+
+    paths_dropped = Signal(list)
+
+    def __init__(self, title: str) -> None:
+        super().__init__(title)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.paths_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 
 class DocumentProcessorWindow(QMainWindow):
@@ -159,10 +254,11 @@ class DocumentProcessorWindow(QMainWindow):
         return scroll_area
 
     def _build_document_panel(self) -> QWidget:
-        panel = QGroupBox("1. Document set")
+        panel = DocumentDropGroupBox("1. Document set")
         layout = QVBoxLayout(panel)
         supported_formats = QLabel(
-            "Supported: PDF, CSV, XLSX, DOCX, DOC. Use preflight to inspect content locally; nothing is uploaded."
+            "Supported: PDF, CSV, XLSX, DOCX, DOC. Drag and drop files here or use Add documents. "
+            "Use preflight to inspect content locally; nothing is uploaded."
         )
         supported_formats.setWordWrap(True)
         layout.addWidget(supported_formats)
@@ -188,6 +284,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.document_count_label = QLabel("0 ready")
         buttons.addWidget(self.document_count_label)
         layout.addLayout(buttons)
+        panel.paths_dropped.connect(self._add_document_paths)
         return panel
 
     def _build_configuration_panel(self) -> QWidget:
@@ -207,6 +304,7 @@ class DocumentProcessorWindow(QMainWindow):
         template_layout.setContentsMargins(0, 0, 0, 0)
         self.contract_template_combo = QComboBox()
         self.contract_template_combo.addItem("Soil laboratory summary", SOIL_LAB_SUMMARY_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Borehole log digitization", BOREHOLE_LOG_TEMPLATE_KEY)
         self.contract_template_combo.addItem("Custom (edit task and output structure)", None)
         template_layout.addWidget(self.contract_template_combo)
         self.apply_template_button = QPushButton("Apply template")
@@ -243,6 +341,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.model_name_combo = QComboBox()
         self.model_name_combo.addItem("gpt-5-mini")
         self.model_name_combo.addItem("gpt-5.4-mini")
+        self.model_name_combo.addItem("gpt-5.6-luna")
         self.model_name_combo.currentIndexChanged.connect(self._refresh_provider_state)
         provider_layout.addRow("Model name", self.model_name_combo)
         self.api_version_input = QLineEdit()
@@ -302,6 +401,11 @@ class DocumentProcessorWindow(QMainWindow):
             str(Path.home()),
             "Documents (*.pdf *.csv *.xlsx *.docx *.doc);;All files (*.*)",
         )
+        self._add_document_paths([Path(path) for path in paths])
+
+    def _add_document_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            return
         seen_paths = {item.path for item in self._documents if item.status is not DocumentStatus.DUPLICATE}
         self._documents.extend(inspect_document(path, seen_paths) for path in paths)
         self._refresh_document_table()
@@ -464,11 +568,12 @@ class DocumentProcessorWindow(QMainWindow):
         )
         try:
             output_path = _write_results_file(results)
-            csv_output_path = _write_csv_file(results, output_path)
+            csv_output_paths = _write_csv_outputs(results, output_path)
         except (OSError, TypeError, json.JSONDecodeError) as error:
             self.queue_status.setText(f"Batch completed, but results could not be written to disk: {error}")
         else:
-            self.queue_status.setText(f"Batch completed. Results written to {output_path} and {csv_output_path}")
+            written = ", ".join(str(path) for path in (output_path, *csv_output_paths))
+            self.queue_status.setText(f"Batch completed. Results written to {written}")
         self._refresh_provider_state()
 
     def _on_batch_failed(self, error: str) -> None:
@@ -573,3 +678,100 @@ def _write_csv_file(results: str, json_output_path: Path) -> Path:
                         }
                     )
     return csv_output_path
+
+
+BOREHOLE_SAMPLE_CSV_FIELDNAMES = (
+    "document",
+    "input_mode",
+    "status",
+    "borehole_id",
+    "surface_elevation",
+    "depth_unit",
+    "sample_id",
+    "top_depth",
+    "bottom_depth",
+    "blow_count",
+)
+BOREHOLE_SOIL_CSV_FIELDNAMES = (
+    "document",
+    "input_mode",
+    "status",
+    "borehole_id",
+    "surface_elevation",
+    "depth_unit",
+    "top_depth",
+    "bottom_depth",
+    "description",
+)
+
+
+def _write_csv_outputs(results: str, json_output_path: Path) -> tuple[Path, ...]:
+    """Write template-appropriate CSV(s): borehole logs split into sample and soil-description files; other templates keep one CSV."""
+    batch_results = json.loads(results)
+    if _is_borehole_log_batch(batch_results):
+        return _write_borehole_log_csv_files(batch_results, json_output_path)
+    return (_write_csv_file(results, json_output_path),)
+
+
+def _is_borehole_log_batch(batch_results: list[dict[str, object]]) -> bool:
+    """Detect the borehole-log schema by its page-level borehole_id or soil_descriptions fields."""
+    for batch_result in batch_results:
+        if not isinstance(batch_result, dict):
+            continue
+        try:
+            extracted = json.loads(batch_result.get("text", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(extracted, dict) and ("borehole_id" in extracted or "soil_descriptions" in extracted):
+            return True
+    return False
+
+
+def _write_borehole_log_csv_files(batch_results: list[dict[str, object]], json_output_path: Path) -> tuple[Path, Path]:
+    """Flatten borehole logs into one sample-per-row CSV and one soil-description-per-row CSV."""
+    samples_path = json_output_path.with_name(f"{json_output_path.stem}_samples.csv")
+    soil_path = json_output_path.with_name(f"{json_output_path.stem}_soil_descriptions.csv")
+    with (
+        samples_path.open("w", encoding="utf-8-sig", newline="") as samples_target,
+        soil_path.open("w", encoding="utf-8-sig", newline="") as soil_target,
+    ):
+        samples_writer = csv.DictWriter(samples_target, fieldnames=BOREHOLE_SAMPLE_CSV_FIELDNAMES)
+        soil_writer = csv.DictWriter(soil_target, fieldnames=BOREHOLE_SOIL_CSV_FIELDNAMES)
+        samples_writer.writeheader()
+        soil_writer.writeheader()
+        for batch_result in batch_results:
+            extracted = json.loads(batch_result.get("text", "{}"))
+            log_context = {
+                "document": batch_result.get("document"),
+                "input_mode": batch_result.get("input_mode"),
+                "status": batch_result.get("status"),
+                "borehole_id": extracted.get("borehole_id"),
+                "surface_elevation": extracted.get("surface_elevation"),
+                "depth_unit": extracted.get("depth_unit"),
+            }
+            samples = extracted.get("samples", [])
+            if not samples:
+                samples_writer.writerow(log_context)
+            for sample in samples:
+                samples_writer.writerow(
+                    {
+                        **log_context,
+                        "sample_id": sample.get("sample_id"),
+                        "top_depth": sample.get("top_depth"),
+                        "bottom_depth": sample.get("bottom_depth"),
+                        "blow_count": sample.get("blow_count"),
+                    }
+                )
+            soil_descriptions = extracted.get("soil_descriptions", [])
+            if not soil_descriptions:
+                soil_writer.writerow(log_context)
+            for soil_description in soil_descriptions:
+                soil_writer.writerow(
+                    {
+                        **log_context,
+                        "top_depth": soil_description.get("top_depth"),
+                        "bottom_depth": soil_description.get("bottom_depth"),
+                        "description": soil_description.get("description"),
+                    }
+                )
+    return (samples_path, soil_path)

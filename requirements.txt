@@ -1,0 +1,7 @@
+# Runtime dependencies for the Document Processor desktop application.
+# Kept in sync with the `dependencies` list in pyproject.toml.
+PySide6>=6.7,<7
+PyMuPDF>=1.24,<2
+openpyxl>=3.1,<4
+pypdf>=5,<7
+python-docx>=1.1,<2
