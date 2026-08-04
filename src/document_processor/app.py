@@ -6,6 +6,8 @@ import csv
 import json
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -47,6 +50,7 @@ from .providers import (
     MicrosoftFoundryConfiguration,
     MicrosoftFoundryProvider,
     ProviderError,
+    ProviderRateLimitError,
 )
 
 
@@ -55,8 +59,9 @@ SOIL_LAB_SUMMARY_PROMPT = (
     "Review the soil laboratory report and extract only the information needed for a geotechnical laboratory "
     "summary table. Set test_type to the reported laboratory test or standard. Add one samples item for each "
     "tested sample, with its borehole or sample location, sample ID, depth, and only its final reportable test "
-    "results. Borehole or sample locations are typically labelled with a 'B', such as 'B-13' or 'PB-13', while "
-    "sample IDs typically contain an 'S'; use these conventions to assign each identifier to the correct field. "
+    "results. Borehole or sample locations are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', "
+    "'P-3', or 'TP-12', while sample IDs typically contain an 'S' or 'MC', such as 'S-15' or 'MC-2'; use these "
+    "conventions to assign each identifier to the correct field. "
     "Include classification only when it is reported as a final test result. Do not extract client, "
     "project details, report dates, personnel, intermediate weights, calculations, narrative summaries, or other "
     "metadata. Preserve reported values and units. Use null for unavailable sample identifiers and an empty results "
@@ -99,7 +104,8 @@ SOIL_LAB_SUMMARY_STRUCTURE = {
 BOREHOLE_LOG_TEMPLATE_KEY = "borehole_log"
 BOREHOLE_LOG_PROMPT = (
     "Digitize this borehole log page into structured data. Set borehole_id to the borehole identifier that labels "
-    "the log; borehole identifiers are typically labelled with a 'B', such as 'B-13' or 'PB-13'. This identifier "
+    "the log; borehole identifiers are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', 'P-3', or "
+    "'TP-12'. This identifier "
     "applies to the whole page. Set surface_elevation to the reported ground surface elevation exactly as written, or "
     "null when none is shown. Determine the single depth unit used on the log (for example 'ft' or 'm') and set "
     "depth_unit to it; record every top_depth and bottom_depth as a plain number in that unit, with no unit suffix. "
@@ -109,7 +115,7 @@ BOREHOLE_LOG_PROMPT = (
     "sample interval is the vertical extent of its marker in the sample-location column; a soil stratum is the vertical "
     "extent of its band in the material-graphics or description column. Ensure top_depth is less than bottom_depth for "
     "each interval. Add one samples item for each sampled interval, with its sample_id and the top_depth and "
-    "bottom_depth of its interval. Sample IDs typically contain an 'S', such as 'S-4'. Set blow_count to the reported "
+    "bottom_depth of its interval. Sample IDs typically contain an 'S' or 'MC', such as 'S-4' or 'MC-2'. Set blow_count to the reported "
     "blow count as text: when the log shows raw per-increment drive counts, join them with single spaces (for example "
     "'8 8 9'); when the log shows a single number, use it as written; set blow_count to null when a sample has no blow "
     "count. Add one soil_descriptions item for each described stratum, with its top_depth, bottom_depth, and "
@@ -165,6 +171,12 @@ MODEL_PRICING_PER_MILLION_TOKENS = {
     "gpt-5.4-mini": {"input": 0.83, "cached_input": 0.09, "output": 4.95},
     "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "output": 6.00},
 }
+# Batch concurrency: number of documents sent to the provider simultaneously by default.
+DEFAULT_CONCURRENCY = 5
+MAX_CONCURRENCY = 32
+# Retry only throttled (429/503) requests, with exponential backoff between attempts.
+MAX_REQUEST_ATTEMPTS = 4
+RETRY_BACKOFF_SECONDS = 2.0
 
 
 class DocumentDropGroupBox(QGroupBox):
@@ -374,6 +386,27 @@ class DocumentProcessorWindow(QMainWindow):
     def _build_queue_panel(self) -> QWidget:
         panel = QGroupBox("4. Results queue")
         layout = QVBoxLayout(panel)
+
+        settings = QHBoxLayout()
+        settings.addWidget(QLabel("Output folder"))
+        self.output_dir_input = QLineEdit(str(_default_output_dir()))
+        self.output_dir_input.setPlaceholderText("Folder for JSON and CSV results")
+        settings.addWidget(self.output_dir_input, 1)
+        browse_output_button = QPushButton("Browse…")
+        browse_output_button.clicked.connect(self._select_output_dir)
+        settings.addWidget(browse_output_button)
+        settings.addSpacing(16)
+        settings.addWidget(QLabel("Max concurrent requests"))
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, MAX_CONCURRENCY)
+        self.concurrency_spin.setValue(DEFAULT_CONCURRENCY)
+        self.concurrency_spin.setToolTip(
+            "How many documents are sent to the provider at the same time. "
+            "Lower this if the provider returns rate-limit errors (HTTP 429)."
+        )
+        settings.addWidget(self.concurrency_spin)
+        layout.addLayout(settings)
+
         actions = QHBoxLayout()
         self.queue_status = QLabel("Draft batch — no provider requests have been made.")
         actions.addWidget(self.queue_status)
@@ -396,11 +429,6 @@ class DocumentProcessorWindow(QMainWindow):
         self.progress_log.setPlaceholderText("Per-document progress will appear here while the batch runs.")
         self.progress_log.setMaximumHeight(120)
         layout.addWidget(self.progress_log)
-        self.results_editor = QPlainTextEdit()
-        self.results_editor.setReadOnly(True)
-        self.results_editor.setPlaceholderText("Completed batch results will appear here and be saved as JSON and CSV files.")
-        self.results_editor.setMinimumHeight(100)
-        layout.addWidget(self.results_editor)
         return panel
 
     def _select_documents(self) -> None:
@@ -411,6 +439,13 @@ class DocumentProcessorWindow(QMainWindow):
             "Documents (*.pdf *.csv *.xlsx *.docx *.doc);;All files (*.*)",
         )
         self._add_document_paths([Path(path) for path in paths])
+
+    def _select_output_dir(self) -> None:
+        current = self.output_dir_input.text().strip()
+        start_dir = current or str(_default_output_dir())
+        directory = QFileDialog.getExistingDirectory(self, "Select output folder", start_dir)
+        if directory:
+            self.output_dir_input.setText(directory)
 
     def _add_document_paths(self, paths: list[Path]) -> None:
         if not paths:
@@ -523,22 +558,70 @@ class DocumentProcessorWindow(QMainWindow):
         threading.Thread(target=self._run_batch, daemon=True).start()
 
     def _run_batch(self) -> None:
+        prompt = self.prompt_editor.toPlainText().strip()
         try:
-            prompt = self.prompt_editor.toPlainText().strip()
             output_structure = json.loads(self.output_structure_editor.toPlainText())
-            mode = ProcessingMode(self.processing_mode_combo.currentData())
-            results: list[dict[str, object]] = []
-            prompt_tokens = 0
-            completion_tokens = 0
-            cached_prompt_tokens = 0
-            ready_documents = [item for item in self._documents if item.is_ready]
-            total_documents = len(ready_documents)
-            self.batch_progress.emit(f"Starting batch: {total_documents} document(s) to process.")
-            for index, document in enumerate(ready_documents, start=1):
-                remaining = total_documents - index
+        except json.JSONDecodeError as error:
+            self.batch_failed.emit(str(error))
+            return
+        mode = ProcessingMode(self.processing_mode_combo.currentData())
+        ready_documents = [item for item in self._documents if item.is_ready]
+        total = len(ready_documents)
+        if total == 0:
+            self.batch_failed.emit("No ready documents to process.")
+            return
+        max_workers = max(1, min(self.concurrency_spin.value(), total))
+        self.batch_progress.emit(f"Starting batch: {total} document(s), up to {max_workers} at a time.")
+
+        # Results are stored by original document index so the output order is stable
+        # regardless of which concurrent request finishes first.
+        results: list[dict[str, object]] = [{} for _ in range(total)]
+        prompt_tokens = 0
+        completion_tokens = 0
+        cached_prompt_tokens = 0
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(self._process_single_document, document, mode, prompt, output_structure): index
+                for index, document in enumerate(ready_documents)
+            }
+            # Token totals accumulate here in this single thread, so no extra locking is required.
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                result, usage = future.result()
+                results[index] = result
+                prompt_tokens += _token_count(usage, "prompt_tokens")
+                completion_tokens += _token_count(usage, "completion_tokens")
+                cached_prompt_tokens += _cached_token_count(usage)
+                completed += 1
+                remaining = total - completed
+                status = str(result.get("status", "processed")).replace("_", " ").title()
                 self.batch_progress.emit(
-                    f"Processing {index}/{total_documents}: {document.path.name} ({remaining} remaining)"
+                    f"{status} {completed}/{total}: {ready_documents[index].path.name} ({remaining} remaining)"
                 )
+        self.batch_completed.emit(
+            json.dumps(results, indent=2, ensure_ascii=False),
+            prompt_tokens,
+            cached_prompt_tokens,
+            completion_tokens,
+            self.model_name_combo.currentText(),
+        )
+
+    def _process_single_document(
+        self,
+        document: DocumentItem,
+        mode: ProcessingMode,
+        prompt: str,
+        output_structure: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Process one document in a worker thread, retrying only on rate limits.
+
+        Returns the per-document result row and its token usage. A single document's
+        failure is captured as a ``failed`` result row so the rest of the batch continues.
+        """
+        last_error: Exception | None = None
+        for attempt in range(MAX_REQUEST_ATTEMPTS):
+            try:
                 if mode is ProcessingMode.PDF_IMAGES:
                     response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, output_structure)
                 else:
@@ -547,27 +630,26 @@ class DocumentProcessorWindow(QMainWindow):
                         artifact = extract_document(document)
                         self._artifacts[document.path] = artifact
                     if artifact.status is not ExtractionStatus.COMPLETE or not artifact.content.strip():
-                        results.append({"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings})
-                        self.batch_progress.emit(
-                            f"Skipped {index}/{total_documents}: {document.path.name} ({artifact.status.value})"
+                        return (
+                            {"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings},
+                            {},
                         )
-                        continue
                     response = self._provider.process_document(artifact.content, prompt, output_structure)
                 usage = response.pop("usage", {})
-                prompt_tokens += _token_count(usage, "prompt_tokens")
-                completion_tokens += _token_count(usage, "completion_tokens")
-                cached_prompt_tokens += _cached_token_count(usage)
-                results.append({"document": document.path.name, "input_mode": mode.value, "status": "completed", **response})
-                self.batch_progress.emit(f"Completed {index}/{total_documents}: {document.path.name}")
-        except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
-            self.batch_failed.emit(str(error))
-            return
-        self.batch_completed.emit(
-            json.dumps(results, indent=2, ensure_ascii=False),
-            prompt_tokens,
-            cached_prompt_tokens,
-            completion_tokens,
-            self.model_name_combo.currentText(),
+                return (
+                    {"document": document.path.name, "input_mode": mode.value, "status": "completed", **response},
+                    usage if isinstance(usage, dict) else {},
+                )
+            except ProviderRateLimitError as error:
+                last_error = error
+                if attempt < MAX_REQUEST_ATTEMPTS - 1:
+                    time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
+            except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
+                last_error = error
+                break
+        return (
+            {"document": document.path.name, "input_mode": mode.value, "status": "failed", "error": str(last_error)},
+            {},
         )
 
     def _on_batch_completed(
@@ -578,7 +660,6 @@ class DocumentProcessorWindow(QMainWindow):
         completion_tokens: int,
         model_name: str,
     ) -> None:
-        self.results_editor.setPlainText(results)
         estimated_cost = _calculate_batch_cost(model_name, prompt_tokens, cached_prompt_tokens, completion_tokens)
         self.token_usage_label.setText(
             f"Batch token usage: input {prompt_tokens:,} | cached input {cached_prompt_tokens:,} | "
@@ -586,7 +667,9 @@ class DocumentProcessorWindow(QMainWindow):
             f"estimated cost ${estimated_cost:.6f}"
         )
         try:
-            output_path = _write_results_file(results)
+            output_text = self.output_dir_input.text().strip()
+            output_dir = Path(output_text) if output_text else None
+            output_path = _write_results_file(results, output_dir)
             csv_output_paths = _write_csv_outputs(results, output_path)
         except (OSError, TypeError, json.JSONDecodeError) as error:
             self.queue_status.setText(f"Batch completed, but results could not be written to disk: {error}")
@@ -616,8 +699,13 @@ def main() -> None:
     raise SystemExit(application.exec())
 
 
+def _default_output_dir() -> Path:
+    """Default folder for JSON and CSV results, relative to the current working directory."""
+    return Path.cwd() / "outputs"
+
+
 def _write_results_file(results: str, output_dir: Path | None = None) -> Path:
-    directory = output_dir or Path.cwd() / "outputs"
+    directory = output_dir or _default_output_dir()
     directory.mkdir(parents=True, exist_ok=True)
     output_path = directory / f"document_processor_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     output_path.write_text(results, encoding="utf-8")

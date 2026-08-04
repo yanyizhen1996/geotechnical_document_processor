@@ -26,6 +26,10 @@ class ProviderRequestError(ProviderError):
     """The configured provider rejected or could not complete a request."""
 
 
+class ProviderRateLimitError(ProviderRequestError):
+    """The provider throttled the request (HTTP 429/503); the caller may retry after a delay."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderReadiness:
     provider: ProviderKind
@@ -189,6 +193,10 @@ class MicrosoftFoundryProvider(DocumentProvider):
                     "https://<resource>.services.ai.azure.com/models (the app appends /chat/completions and api-version). "
                     "For Azure OpenAI-style routes, verify the deployment path and api-version in the URL. "
                     f"Provider response: {detail}"
+                ) from error
+            if error.code in (429, 503):
+                raise ProviderRateLimitError(
+                    f"Microsoft Foundry throttled the request ({error.code}): {detail}"
                 ) from error
             raise ProviderRequestError(f"Microsoft Foundry request failed ({error.code}): {detail}") from error
         except (URLError, TimeoutError) as error:
