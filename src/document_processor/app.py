@@ -202,6 +202,7 @@ class DocumentProcessorWindow(QMainWindow):
 
     batch_completed = Signal(str, int, int, int, str)
     batch_failed = Signal(str)
+    batch_progress = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -214,6 +215,7 @@ class DocumentProcessorWindow(QMainWindow):
         self._build_ui()
         self.batch_completed.connect(self._on_batch_completed)
         self.batch_failed.connect(self._on_batch_failed)
+        self.batch_progress.connect(self._on_batch_progress)
         self._refresh_provider_state()
 
     def _build_ui(self) -> None:
@@ -387,6 +389,13 @@ class DocumentProcessorWindow(QMainWindow):
         layout.addLayout(actions)
         self.token_usage_label = QLabel("Batch token usage and estimated cost will appear after processing.")
         layout.addWidget(self.token_usage_label)
+        layout.addWidget(QLabel("Progress log"))
+        # Live per-document progress so long batches show activity instead of a silent wait.
+        self.progress_log = QPlainTextEdit()
+        self.progress_log.setReadOnly(True)
+        self.progress_log.setPlaceholderText("Per-document progress will appear here while the batch runs.")
+        self.progress_log.setMaximumHeight(120)
+        layout.addWidget(self.progress_log)
         self.results_editor = QPlainTextEdit()
         self.results_editor.setReadOnly(True)
         self.results_editor.setPlaceholderText("Completed batch results will appear here and be saved as JSON and CSV files.")
@@ -510,6 +519,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.process_button.setEnabled(False)
         self.queue_status.setText("Processing each document in an independent Microsoft Foundry request…")
         self.token_usage_label.setText("Calculating batch token usage…")
+        self.progress_log.clear()
         threading.Thread(target=self._run_batch, daemon=True).start()
 
     def _run_batch(self) -> None:
@@ -521,9 +531,14 @@ class DocumentProcessorWindow(QMainWindow):
             prompt_tokens = 0
             completion_tokens = 0
             cached_prompt_tokens = 0
-            for document in self._documents:
-                if not document.is_ready:
-                    continue
+            ready_documents = [item for item in self._documents if item.is_ready]
+            total_documents = len(ready_documents)
+            self.batch_progress.emit(f"Starting batch: {total_documents} document(s) to process.")
+            for index, document in enumerate(ready_documents, start=1):
+                remaining = total_documents - index
+                self.batch_progress.emit(
+                    f"Processing {index}/{total_documents}: {document.path.name} ({remaining} remaining)"
+                )
                 if mode is ProcessingMode.PDF_IMAGES:
                     response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, output_structure)
                 else:
@@ -533,6 +548,9 @@ class DocumentProcessorWindow(QMainWindow):
                         self._artifacts[document.path] = artifact
                     if artifact.status is not ExtractionStatus.COMPLETE or not artifact.content.strip():
                         results.append({"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings})
+                        self.batch_progress.emit(
+                            f"Skipped {index}/{total_documents}: {document.path.name} ({artifact.status.value})"
+                        )
                         continue
                     response = self._provider.process_document(artifact.content, prompt, output_structure)
                 usage = response.pop("usage", {})
@@ -540,6 +558,7 @@ class DocumentProcessorWindow(QMainWindow):
                 completion_tokens += _token_count(usage, "completion_tokens")
                 cached_prompt_tokens += _cached_token_count(usage)
                 results.append({"document": document.path.name, "input_mode": mode.value, "status": "completed", **response})
+                self.batch_progress.emit(f"Completed {index}/{total_documents}: {document.path.name}")
         except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
             self.batch_failed.emit(str(error))
             return
@@ -575,6 +594,12 @@ class DocumentProcessorWindow(QMainWindow):
             written = ", ".join(str(path) for path in (output_path, *csv_output_paths))
             self.queue_status.setText(f"Batch completed. Results written to {written}")
         self._refresh_provider_state()
+
+    def _on_batch_progress(self, message: str) -> None:
+        """Append a timestamped progress line and mirror it in the queue status label."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.progress_log.appendPlainText(f"[{timestamp}] {message}")
+        self.queue_status.setText(message)
 
     def _on_batch_failed(self, error: str) -> None:
         self.queue_status.setText("Batch failed. No provider response was written to disk.")
