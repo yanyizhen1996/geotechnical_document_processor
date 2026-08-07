@@ -130,7 +130,7 @@ def test_soil_lab_summary_template_populates_a_compact_output_structure() -> Non
         "value": {"type": ["string", "null"]},
         "unit": {"type": ["string", "null"]},
     }
-    assert window.contract_template_combo.count() == 3
+    assert window.contract_template_combo.count() == 4
 
     window.prompt_editor.setPlainText("Keep this custom prompt")
     window.output_structure_editor.setPlainText('{"type": "object"}')
@@ -248,6 +248,141 @@ def test_write_csv_outputs_splits_borehole_samples_and_soil_descriptions(tmp_pat
     ]
 
 
+def test_write_csv_outputs_flattens_geotech_lab_reports_with_metadata(tmp_path) -> None:
+    results = json.dumps(
+        [
+            {
+                "document": "r_value.pdf",
+                "input_mode": "pdf_images",
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "test_type": "Resistance R-Value - ASTM D2844",
+                        "location": "PB-41",
+                        "sample_number": "G-26-0016",
+                        "project_number": "A26173.00276",
+                        "project": "RNO92 On-Call Lab Testing",
+                        "report_date": "7/25/2026",
+                        "summary": "R-value at 300 psi exudation pressure = 75.3",
+                        "result_columns": ["No.", "Density pcf", "R Value"],
+                        "result_rows": [
+                            ["1", "108.0", "67.2"],
+                            ["2", "107.8", "77.0"],
+                        ],
+                    }
+                ),
+            },
+            {
+                "document": "thermal.pdf",
+                "input_mode": "pdf_images",
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "test_type": "Thermal Conductivity - ASTM D5334",
+                        "location": "PB-31",
+                        "sample_number": "G-26-0016",
+                        "project_number": "A26173.00276.000",
+                        "project": "RNO92 On-Call Lab Testing",
+                        "report_date": "7/16-7/20/2026",
+                        "summary": None,
+                        "result_columns": ["Sample ID", "Temp. (C)"],
+                        "result_rows": [["PB-31", "23.5"]],
+                    }
+                ),
+            },
+        ]
+    )
+    json_output_path = _write_results_file(results, tmp_path)
+
+    csv_paths = _write_csv_outputs(results, json_output_path)
+
+    assert csv_paths == (json_output_path.with_suffix(".csv"),)
+    with csv_paths[0].open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    # Fixed metadata columns first, then the union of result columns across both report types.
+    assert fieldnames == [
+        "document",
+        "input_mode",
+        "status",
+        "test_type",
+        "location",
+        "sample_number",
+        "project_number",
+        "project",
+        "report_date",
+        "summary",
+        "row_number",
+        "No.",
+        "Density pcf",
+        "R Value",
+        "Sample ID",
+        "Temp. (C)",
+    ]
+    assert rows[0]["document"] == "r_value.pdf"
+    assert rows[0]["test_type"] == "Resistance R-Value - ASTM D2844"
+    assert rows[0]["location"] == "PB-41"
+    assert rows[0]["summary"] == "R-value at 300 psi exudation pressure = 75.3"
+    assert rows[0]["row_number"] == "1"
+    assert rows[0]["Density pcf"] == "108.0"
+    assert rows[0]["Sample ID"] == ""
+    assert rows[2]["document"] == "thermal.pdf"
+    assert rows[2]["location"] == "PB-31"
+    assert rows[2]["Sample ID"] == "PB-31"
+    assert rows[2]["Temp. (C)"] == "23.5"
+    assert rows[2]["No."] == ""
+
+
+def test_geotech_lab_report_merges_headers_differing_only_by_punctuation(tmp_path) -> None:
+    results = json.dumps(
+        [
+            {
+                "document": "pb_1.pdf",
+                "input_mode": "pdf_images",
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "test_type": "R-Value - ASTM D2844",
+                        "location": "PB-1",
+                        "sample_number": "G-26-0016",
+                        "result_columns": ["No.", "Exud. Pressure psi", "R Value"],
+                        "result_rows": [["1", "207", "58.9"]],
+                    }
+                ),
+            },
+            {
+                "document": "pb_7.pdf",
+                "input_mode": "pdf_images",
+                "status": "completed",
+                "text": json.dumps(
+                    {
+                        "test_type": "R-Value - ASTM D2844",
+                        "location": "PB-7",
+                        "sample_number": "G-26-0016",
+                        # Vision model read the period as a hyphen for this document.
+                        "result_columns": ["No.", "Exud- Pressure psi", "R Value"],
+                        "result_rows": [["1", "491", "68.8"]],
+                    }
+                ),
+            },
+        ]
+    )
+    json_output_path = _write_results_file(results, tmp_path)
+
+    csv_paths = _write_csv_outputs(results, json_output_path)
+
+    with csv_paths[0].open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    # The two punctuation variants merge into one column using the first-seen spelling.
+    assert fieldnames.count("Exud. Pressure psi") == 1
+    assert "Exud- Pressure psi" not in fieldnames
+    assert rows[0]["Exud. Pressure psi"] == "207"
+    assert rows[1]["Exud. Pressure psi"] == "491"
+
+
 def test_drag_and_drop_adds_documents(tmp_path) -> None:
     path = tmp_path / "dropped.csv"
     path.write_text("a,b\n1,2\n", encoding="utf-8")
@@ -330,7 +465,7 @@ def test_image_mode_renders_a_pdf_and_uses_the_image_provider(tmp_path) -> None:
     result = json.loads(results[0][0])[0]
     assert result["input_mode"] == ProcessingMode.PDF_IMAGES
     assert "usage" not in result
-    assert results[0][1:] == (200, 100, 50, "gpt-5-mini")
+    assert results[0][1:] == (200, 100, 50, "gpt-5.6-luna")
     assert window.token_usage_label.text() == (
-        "Batch token usage: input 200 | cached input 100 | output 50 | total 250 | estimated cost $0.000141"
+        "Batch token usage: input 200 | cached input 100 | output 50 | total 250 | estimated cost $0.000410"
     )

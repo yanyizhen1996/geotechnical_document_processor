@@ -162,9 +162,56 @@ BOREHOLE_LOG_STRUCTURE = {
     "required": ["borehole_id", "surface_elevation", "depth_unit", "samples", "soil_descriptions"],
     "additionalProperties": False,
 }
+GEOTECH_LAB_REPORT_TEMPLATE_KEY = "geotech_lab_report"
+GEOTECH_LAB_REPORT_PROMPT = (
+    "This is a single-page geotechnical laboratory report (for example an R-value, resistivity, thermal "
+    "conductivity, or compaction report). Extract two things: the report metadata and the one primary results "
+    "table. Metadata: set test_type to the reported test name or ASTM/standard designation (for example "
+    "'Resistance R-Value and Expansion Pressure - ASTM D2844' or 'Thermal Conductivity - ASTM D5334'); set "
+    "location to the boring or sample location (typically labelled with a 'B' or 'P', such as 'PB-1' or 'P-3'); "
+    "set sample_number to the reported sample or specimen number; set project_number, project, and report_date "
+    "to their reported values; set summary to any single-line headline result (for example "
+    "'R-value at 300 psi exudation pressure = 64.1'), or null when none. The primary results table is the main "
+    "numeric per-specimen results table (the block of measured test values), not a chart and not a label box. "
+    "Set result_columns to that table's column headers in left-to-right order, exactly as printed, joining a "
+    "header that wraps onto several lines into one string. Set result_rows to its data rows top-to-bottom, where "
+    "each row is a list of cell values aligned one-to-one with result_columns; use null for an empty cell and "
+    "keep every value exactly as printed, including units and decimals. Do NOT treat the 'Sample Information', "
+    "'Soil Parameters', 'Test Parameters', client/project heading boxes, personnel boxes, remarks, logos, page "
+    "headers/footers, or the plotted chart as the results table. Do not invent, reorder, summarize, or calculate "
+    "values, and use null for any metadata field that is not shown."
+)
+GEOTECH_LAB_REPORT_STRUCTURE = {
+    "type": "object",
+    "properties": {
+        "test_type": {"type": ["string", "null"], "description": "Reported test name or ASTM/standard designation"},
+        "location": {"type": ["string", "null"], "description": "Boring or sample location, e.g. 'PB-1'"},
+        "sample_number": {"type": ["string", "null"], "description": "Reported sample or specimen number"},
+        "project_number": {"type": ["string", "null"], "description": "Reported project number"},
+        "project": {"type": ["string", "null"], "description": "Reported project name"},
+        "report_date": {"type": ["string", "null"], "description": "Reported report or test date, as written"},
+        "summary": {"type": ["string", "null"], "description": "Single-line headline result, or null"},
+        "result_columns": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Primary results table column headers, left-to-right, exactly as printed",
+        },
+        "result_rows": {
+            "type": "array",
+            "items": {
+                "type": "array",
+                "items": {"type": ["string", "null"]},
+            },
+            "description": "Primary results table data rows; each row aligns one-to-one with result_columns",
+        },
+    },
+    "required": ["test_type", "location", "sample_number", "result_columns", "result_rows"],
+    "additionalProperties": False,
+}
 EXTRACTION_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
     SOIL_LAB_SUMMARY_TEMPLATE_KEY: (SOIL_LAB_SUMMARY_PROMPT, SOIL_LAB_SUMMARY_STRUCTURE),
     BOREHOLE_LOG_TEMPLATE_KEY: (BOREHOLE_LOG_PROMPT, BOREHOLE_LOG_STRUCTURE),
+    GEOTECH_LAB_REPORT_TEMPLATE_KEY: (GEOTECH_LAB_REPORT_PROMPT, GEOTECH_LAB_REPORT_STRUCTURE),
 }
 MODEL_PRICING_PER_MILLION_TOKENS = {
     "gpt-5-mini": {"input": 0.28, "cached_input": 0.03, "output": 2.20},
@@ -317,8 +364,9 @@ class DocumentProcessorWindow(QMainWindow):
         template_layout = QHBoxLayout(template_controls)
         template_layout.setContentsMargins(0, 0, 0, 0)
         self.contract_template_combo = QComboBox()
-        self.contract_template_combo.addItem("Soil laboratory summary", SOIL_LAB_SUMMARY_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Geotechnical lab report (extract values)", SOIL_LAB_SUMMARY_TEMPLATE_KEY)
         self.contract_template_combo.addItem("Borehole log digitization", BOREHOLE_LOG_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Geotechnical lab report (extract table)", GEOTECH_LAB_REPORT_TEMPLATE_KEY)
         self.contract_template_combo.addItem("Custom (edit task and output structure)", None)
         template_layout.addWidget(self.contract_template_combo)
         self.apply_template_button = QPushButton("Apply template")
@@ -356,6 +404,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.model_name_combo.addItem("gpt-5-mini")
         self.model_name_combo.addItem("gpt-5.4-mini")
         self.model_name_combo.addItem("gpt-5.6-luna")
+        self.model_name_combo.setCurrentText("gpt-5.6-luna")
         self.model_name_combo.currentIndexChanged.connect(self._refresh_provider_state)
         provider_layout.addRow("Model name", self.model_name_combo)
         self.api_version_input = QLineEdit()
@@ -823,6 +872,8 @@ def _write_csv_outputs(results: str, json_output_path: Path) -> tuple[Path, ...]
     batch_results = json.loads(results)
     if _is_borehole_log_batch(batch_results):
         return _write_borehole_log_csv_files(batch_results, json_output_path)
+    if _is_geotech_lab_report_batch(batch_results):
+        return (_write_geotech_lab_report_csv_file(batch_results, json_output_path),)
     return (_write_csv_file(results, json_output_path),)
 
 
@@ -838,6 +889,105 @@ def _is_borehole_log_batch(batch_results: list[dict[str, object]]) -> bool:
         if isinstance(extracted, dict) and ("borehole_id" in extracted or "soil_descriptions" in extracted):
             return True
     return False
+
+
+GEOTECH_LAB_REPORT_BASE_FIELDNAMES = (
+    "document",
+    "input_mode",
+    "status",
+    "test_type",
+    "location",
+    "sample_number",
+    "project_number",
+    "project",
+    "report_date",
+    "summary",
+    "row_number",
+)
+
+
+def _is_geotech_lab_report_batch(batch_results: list[dict[str, object]]) -> bool:
+    """Detect the geotechnical lab report schema by its 'result_columns'/'result_rows' fields."""
+    for batch_result in batch_results:
+        if not isinstance(batch_result, dict):
+            continue
+        try:
+            extracted = json.loads(batch_result.get("text", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(extracted, dict) and ("result_columns" in extracted or "result_rows" in extracted):
+            return True
+    return False
+
+
+def _normalize_header(header: str) -> str:
+    """Canonical key for a table header: lowercase, punctuation stripped, whitespace collapsed.
+
+    Lets vision-model header variants like 'Exud. Pressure psi' and 'Exud- Pressure psi'
+    merge into a single CSV column instead of splitting on punctuation differences.
+    """
+    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in header)
+    return " ".join(cleaned.split())
+
+
+def _write_geotech_lab_report_csv_file(batch_results: list[dict[str, object]], json_output_path: Path) -> Path:
+    """Flatten geotechnical lab reports into one CSV row per results-table row.
+
+    Report metadata (test type, location, sample number, etc.) goes into fixed leading columns.
+    The results table differs by report type, so the trailing columns are the union of every
+    result column seen across the batch, in first-seen order; unused cells stay blank. Headers
+    that differ only in punctuation, spacing, or case are merged into the first-seen spelling.
+    """
+    column_order: list[str] = []
+    canonical_to_display: dict[str, str] = {}
+    base_canonicals = {_normalize_header(name) for name in GEOTECH_LAB_REPORT_BASE_FIELDNAMES}
+    parsed_documents: list[tuple[dict[str, object], dict[str, object]]] = []
+    # First pass: parse each document once and collect the union of result columns by canonical key.
+    for batch_result in batch_results:
+        try:
+            extracted = json.loads(batch_result.get("text", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            extracted = {}
+        if not isinstance(extracted, dict):
+            extracted = {}
+        parsed_documents.append((batch_result, extracted))
+        for column in extracted.get("result_columns", []) or []:
+            canonical = _normalize_header(column)
+            if not canonical or canonical in base_canonicals or canonical in canonical_to_display:
+                continue
+            canonical_to_display[canonical] = column
+            column_order.append(column)
+    fieldnames = (*GEOTECH_LAB_REPORT_BASE_FIELDNAMES, *column_order)
+    csv_output_path = json_output_path.with_suffix(".csv")
+    with csv_output_path.open("w", encoding="utf-8-sig", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for batch_result, extracted in parsed_documents:
+            metadata = {
+                "document": batch_result.get("document"),
+                "input_mode": batch_result.get("input_mode"),
+                "status": batch_result.get("status"),
+                "test_type": extracted.get("test_type"),
+                "location": extracted.get("location"),
+                "sample_number": extracted.get("sample_number"),
+                "project_number": extracted.get("project_number"),
+                "project": extracted.get("project"),
+                "report_date": extracted.get("report_date"),
+                "summary": extracted.get("summary"),
+            }
+            columns = extracted.get("result_columns", []) or []
+            rows = extracted.get("result_rows", []) or []
+            if not rows:
+                writer.writerow(metadata)
+                continue
+            for row_number, row in enumerate(rows, start=1):
+                # Route each cell to the merged first-seen header via its canonical key.
+                cell_map = {
+                    canonical_to_display.get(_normalize_header(column), column): value
+                    for column, value in zip(columns, row)
+                }
+                writer.writerow({**metadata, "row_number": row_number, **cell_map})
+    return csv_output_path
 
 
 def _write_borehole_log_csv_files(batch_results: list[dict[str, object]], json_output_path: Path) -> tuple[Path, Path]:
