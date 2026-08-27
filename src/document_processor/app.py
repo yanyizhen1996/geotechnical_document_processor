@@ -39,18 +39,17 @@ from PySide6.QtWidgets import (
 from .domain import (
     DocumentItem,
     DocumentStatus,
-    ExtractionArtifact,
-    ExtractionStatus,
     ProcessingMode,
     ProviderKind,
     inspect_document,
 )
-from .extraction import ExtractionError, extract_document, render_pdf_pages
+from .extraction import PdfRenderingError, render_pdf_pages
 from .providers import (
     MicrosoftFoundryConfiguration,
     MicrosoftFoundryProvider,
     ProviderError,
     ProviderRateLimitError,
+    ProviderTransientError,
 )
 
 
@@ -101,8 +100,8 @@ SOIL_LAB_SUMMARY_STRUCTURE = {
     "required": ["test_type", "samples"],
     "additionalProperties": False,
 }
-BOREHOLE_LOG_TEMPLATE_KEY = "borehole_log"
-BOREHOLE_LOG_PROMPT = (
+BOREHOLE_LOG_TEMPLATE_1_KEY = "borehole_log_standard_1"
+BOREHOLE_LOG_TEMPLATE_1_PROMPT = (
     "Digitize this borehole log page into structured data. Set borehole_id to the borehole identifier that labels "
     "the log; borehole identifiers are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', 'P-3', or "
     "'TP-12'. This identifier "
@@ -128,7 +127,7 @@ BOREHOLE_LOG_PROMPT = (
 BOREHOLE_LOG_STRUCTURE = {
     "type": "object",
     "properties": {
-        "borehole_id": {"type": ["string", "null"], "description": "Borehole identifier for the whole page; typically contains 'B'"},
+        "borehole_id": {"type": ["string", "null"], "description": "Borehole identifier for the whole page, as reported"},
         "surface_elevation": {"type": ["string", "null"], "description": "Reported ground surface elevation, as written"},
         "depth_unit": {"type": ["string", "null"], "description": "Single depth unit used across the log, e.g. 'ft' or 'm'"},
         "samples": {
@@ -162,6 +161,33 @@ BOREHOLE_LOG_STRUCTURE = {
     "required": ["borehole_id", "surface_elevation", "depth_unit", "samples", "soil_descriptions"],
     "additionalProperties": False,
 }
+BOREHOLE_LOG_TEMPLATE_2_KEY = "borehole_log_standard_2"
+BOREHOLE_LOG_TEMPLATE_2_PROMPT = (
+    "Digitize this borehole log page into structured data. Set borehole_id to the borehole identifier that labels "
+    "the log; borehole identifiers are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', 'P-3', or "
+    "'TP-12'. This identifier applies to the whole page. Set surface_elevation to the reported ground surface "
+    "elevation exactly as written, or null "
+    "when none is shown. Determine the single depth unit used on the log (for example 'ft' or 'm') and set "
+    "depth_unit to it; record every top_depth and bottom_depth as a plain number in that unit, with no unit suffix. "
+    "Sample interval depths are shown on a vertical depth scale and are usually not printed for each interval, so "
+    "read each interval's top and bottom by aligning the edges of its sample marker or material-graphics band to "
+    "that scale and interpolate as precisely as possible. A sample interval is the vertical extent of its marker in "
+    "the samples column; a soil stratum is the vertical extent of its band in the material-graphics or description "
+    "column. Ensure top_depth is less than bottom_depth for each interval. Add one samples item for each sampled "
+    "interval, with its sample_id and the top_depth and bottom_depth of its interval. Sample IDs typically contain "
+    "an 'S' or 'MC', such as 'S-4' or 'MC-2'. Blow counts are shown graphically in a zone on the right side of the "
+    "log, with the horizontal blow-count scale displayed at the top of that zone. At each sample depth, a triangle "
+    "marks the blow count. Align the triangle marker to the horizontal scale at the top of the zone and record its "
+    "inferred value as blow_count, even when no ordinary numeric value is printed. Values at or above 50 blows per "
+    "6 inches may instead be printed as a refusal notation, such as '50/4\"'; preserve that notation exactly. Set "
+    "blow_count to null only when neither a readable triangle marker nor a printed refusal notation is present. Add "
+    "one soil_descriptions item for each described stratum, with its top_depth, "
+    "bottom_depth, and description text; strata boundaries are independent of the sample intervals. Preserve "
+    "reported values exactly, other than normalizing depths as described. Do not extract client, project, contractor, "
+    "dates, personnel, equipment, drilling method, water levels, narrative notes, or other metadata unless it is "
+    "one of the fields above. Use null for any unavailable field and an empty list only when the log has no samples "
+    "or no soil descriptions."
+)
 GEOTECH_LAB_REPORT_TEMPLATE_KEY = "geotech_lab_report"
 GEOTECH_LAB_REPORT_PROMPT = (
     "This is a single-page geotechnical laboratory report (for example an R-value, resistivity, thermal "
@@ -208,10 +234,13 @@ GEOTECH_LAB_REPORT_STRUCTURE = {
     "required": ["test_type", "location", "sample_number", "result_columns", "result_rows"],
     "additionalProperties": False,
 }
+PDF_MARKDOWN_TEMPLATE_KEY = "pdf_markdown"
+PDF_MARKDOWN_PROMPT = "Preserve all visible content faithfully, including tables, handwriting, and form fields."
 EXTRACTION_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
     SOIL_LAB_SUMMARY_TEMPLATE_KEY: (SOIL_LAB_SUMMARY_PROMPT, SOIL_LAB_SUMMARY_STRUCTURE),
-    BOREHOLE_LOG_TEMPLATE_KEY: (BOREHOLE_LOG_PROMPT, BOREHOLE_LOG_STRUCTURE),
     GEOTECH_LAB_REPORT_TEMPLATE_KEY: (GEOTECH_LAB_REPORT_PROMPT, GEOTECH_LAB_REPORT_STRUCTURE),
+    BOREHOLE_LOG_TEMPLATE_1_KEY: (BOREHOLE_LOG_TEMPLATE_1_PROMPT, BOREHOLE_LOG_STRUCTURE),
+    BOREHOLE_LOG_TEMPLATE_2_KEY: (BOREHOLE_LOG_TEMPLATE_2_PROMPT, BOREHOLE_LOG_STRUCTURE),
 }
 MODEL_PRICING_PER_MILLION_TOKENS = {
     "gpt-5-mini": {"input": 0.28, "cached_input": 0.03, "output": 2.20},
@@ -221,7 +250,7 @@ MODEL_PRICING_PER_MILLION_TOKENS = {
 # Batch concurrency: number of documents sent to the provider simultaneously by default.
 DEFAULT_CONCURRENCY = 5
 MAX_CONCURRENCY = 32
-# Retry only throttled (429/503) requests, with exponential backoff between attempts.
+# Retry throttled and transient network failures with exponential backoff between attempts.
 MAX_REQUEST_ATTEMPTS = 4
 RETRY_BACKOFF_SECONDS = 2.0
 
@@ -269,7 +298,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.setMinimumSize(800, 600)
         self.resize(1180, 760)
         self._documents: list[DocumentItem] = []
-        self._artifacts: dict[Path, ExtractionArtifact] = {}
+        self._structured_prompt_before_markdown: tuple[str, str] | None = None
         self._provider = MicrosoftFoundryProvider()
         self._build_ui()
         self.batch_completed.connect(self._on_batch_completed)
@@ -318,8 +347,8 @@ class DocumentProcessorWindow(QMainWindow):
         panel = DocumentDropGroupBox("1. Document set")
         layout = QVBoxLayout(panel)
         supported_formats = QLabel(
-            "Supported: PDF, CSV, XLSX, DOCX, DOC. Drag and drop files here or use Add documents. "
-            "Use preflight to inspect content locally; nothing is uploaded."
+            "Supported: PDF. Drag and drop files here or use Add documents. "
+            "Pages are rendered locally and sent only after a provider is configured."
         )
         supported_formats.setWordWrap(True)
         layout.addWidget(supported_formats)
@@ -338,9 +367,6 @@ class DocumentProcessorWindow(QMainWindow):
         remove_button = QPushButton("Remove selected")
         remove_button.clicked.connect(self._remove_selected_documents)
         buttons.addWidget(remove_button)
-        preflight_button = QPushButton("Preflight selected")
-        preflight_button.clicked.connect(self._preflight_selected_documents)
-        buttons.addWidget(preflight_button)
         buttons.addStretch()
         self.document_count_label = QLabel("0 ready")
         buttons.addWidget(self.document_count_label)
@@ -356,34 +382,29 @@ class DocumentProcessorWindow(QMainWindow):
         prompt_group = QGroupBox("2. Extraction instructions")
         prompt_layout = QVBoxLayout(prompt_group)
         mode_layout = QFormLayout()
-        self.processing_mode_combo = QComboBox()
-        self.processing_mode_combo.addItem("PDF page images (vision model)", ProcessingMode.PDF_IMAGES)
-        self.processing_mode_combo.addItem("Extracted text (Not Recommended for PDF Processing)", ProcessingMode.TEXT)
-        mode_layout.addRow("Document input", self.processing_mode_combo)
-        template_controls = QWidget()
-        template_layout = QHBoxLayout(template_controls)
-        template_layout.setContentsMargins(0, 0, 0, 0)
         self.contract_template_combo = QComboBox()
-        self.contract_template_combo.addItem("Geotechnical lab report (extract values)", SOIL_LAB_SUMMARY_TEMPLATE_KEY)
-        self.contract_template_combo.addItem("Borehole log digitization", BOREHOLE_LOG_TEMPLATE_KEY)
-        self.contract_template_combo.addItem("Geotechnical lab report (extract table)", GEOTECH_LAB_REPORT_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Geotechnical Lab Reports (Extract Values)", SOIL_LAB_SUMMARY_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Geotechnical Lab Reports (Extract Tables)", GEOTECH_LAB_REPORT_TEMPLATE_KEY)
+        self.contract_template_combo.addItem("Borehole Log Digitization (Standard Template 1)", BOREHOLE_LOG_TEMPLATE_1_KEY)
+        self.contract_template_combo.addItem("Borehole Log Digitization (Standard Template 2)", BOREHOLE_LOG_TEMPLATE_2_KEY)
+        self.contract_template_combo.addItem("General PDF Text transcription", PDF_MARKDOWN_TEMPLATE_KEY)
         self.contract_template_combo.addItem("Custom (edit task and output structure)", None)
-        template_layout.addWidget(self.contract_template_combo)
-        self.apply_template_button = QPushButton("Apply template")
-        self.apply_template_button.clicked.connect(self._apply_selected_template)
-        template_layout.addWidget(self.apply_template_button)
-        mode_layout.addRow("Extraction template", template_controls)
+        self.contract_template_combo.currentIndexChanged.connect(self._on_template_selected)
+        mode_layout.addRow("Extraction template", self.contract_template_combo)
         prompt_layout.addLayout(mode_layout)
-        prompt_layout.addWidget(QLabel("Task instructions (applied independently to every document)"))
+        self.prompt_instruction_label = QLabel("Task instructions (applied independently to every document)")
+        prompt_layout.addWidget(self.prompt_instruction_label)
         self.prompt_editor = QPlainTextEdit()
         self.prompt_editor.setPlaceholderText("Describe the information to identify in each document.")
         self.prompt_editor.setMinimumHeight(105)
         prompt_layout.addWidget(self.prompt_editor)
-        prompt_layout.addWidget(QLabel("Output structure (editable JSON)"))
+        self.output_structure_label = QLabel("Output structure (editable JSON)")
+        prompt_layout.addWidget(self.output_structure_label)
         self.output_structure_editor = QPlainTextEdit()
         self.output_structure_editor.setMinimumHeight(185)
         prompt_layout.addWidget(self.output_structure_editor)
         self._apply_selected_template()
+        self._update_template_controls()
         layout.addWidget(prompt_group)
 
         provider_group = QGroupBox("3. Provider and API configuration")
@@ -426,11 +447,47 @@ class DocumentProcessorWindow(QMainWindow):
 
     def _apply_selected_template(self) -> None:
         template_key = self.contract_template_combo.currentData()
+        if template_key == PDF_MARKDOWN_TEMPLATE_KEY:
+            if self._structured_prompt_before_markdown is None:
+                self._structured_prompt_before_markdown = (
+                    self.prompt_editor.toPlainText(),
+                    self.output_structure_editor.toPlainText(),
+                )
+            self.prompt_editor.setPlainText(PDF_MARKDOWN_PROMPT)
+            return
         if template_key is None:
+            if self._structured_prompt_before_markdown is not None:
+                prompt, output_structure = self._structured_prompt_before_markdown
+                self.prompt_editor.setPlainText(prompt)
+                self.output_structure_editor.setPlainText(output_structure)
+                self._structured_prompt_before_markdown = None
             return
         prompt, output_structure = EXTRACTION_TEMPLATES[template_key]
         self.prompt_editor.setPlainText(prompt)
         self.output_structure_editor.setPlainText(json.dumps(output_structure, indent=2))
+        self._structured_prompt_before_markdown = None
+
+    def _on_template_selected(self, _index: int) -> None:
+        """Apply named templates immediately when the user selects them."""
+        self._apply_selected_template()
+        self._update_template_controls()
+
+    def _processing_mode(self) -> ProcessingMode:
+        """Choose the internal vision workflow from the selected extraction template."""
+        if self.contract_template_combo.currentData() == PDF_MARKDOWN_TEMPLATE_KEY:
+            return ProcessingMode.PDF_MARKDOWN
+        return ProcessingMode.PDF_IMAGES
+
+    def _update_template_controls(self) -> None:
+        """Show structured-extraction controls only for modes that produce JSON results."""
+        is_markdown_mode = self._processing_mode() is ProcessingMode.PDF_MARKDOWN
+        self.output_structure_editor.setEnabled(not is_markdown_mode)
+        self.output_structure_label.setVisible(not is_markdown_mode)
+        self.output_structure_editor.setVisible(not is_markdown_mode)
+        if is_markdown_mode:
+            self.prompt_instruction_label.setText("Additional page-transcription instructions")
+        else:
+            self.prompt_instruction_label.setText("Task instructions (applied independently to every document)")
 
     def _build_queue_panel(self) -> QWidget:
         panel = QGroupBox("4. Results queue")
@@ -439,7 +496,7 @@ class DocumentProcessorWindow(QMainWindow):
         settings = QHBoxLayout()
         settings.addWidget(QLabel("Output folder"))
         self.output_dir_input = QLineEdit(str(_default_output_dir()))
-        self.output_dir_input.setPlaceholderText("Folder for JSON and CSV results")
+        self.output_dir_input.setPlaceholderText("Folder for JSON, CSV, and Markdown results")
         settings.addWidget(self.output_dir_input, 1)
         browse_output_button = QPushButton("Browse…")
         browse_output_button.clicked.connect(self._select_output_dir)
@@ -485,7 +542,7 @@ class DocumentProcessorWindow(QMainWindow):
             self,
             "Select documents",
             str(Path.home()),
-            "Documents (*.pdf *.csv *.xlsx *.docx *.doc);;All files (*.*)",
+            "PDF documents (*.pdf);;All files (*.*)",
         )
         self._add_document_paths([Path(path) for path in paths])
 
@@ -506,7 +563,6 @@ class DocumentProcessorWindow(QMainWindow):
     def _remove_selected_documents(self) -> None:
         rows = sorted({index.row() for index in self.document_table.selectedIndexes()}, reverse=True)
         for row in rows:
-            self._artifacts.pop(self._documents[row].path, None)
             del self._documents[row]
         self._refresh_document_table()
 
@@ -520,30 +576,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.document_count_label.setText(f"{ready_count} ready")
 
     def _document_detail(self, item: DocumentItem) -> str:
-        artifact = self._artifacts.get(item.path)
-        if artifact is None:
-            return item.message or "Not preflighted"
-        if artifact.warnings:
-            return artifact.warnings[0]
-        return f"Local preflight complete: {len(artifact.source_locations)} source locations"
-
-    def _preflight_selected_documents(self) -> None:
-        rows = sorted({index.row() for index in self.document_table.selectedIndexes()})
-        if not rows:
-            QMessageBox.information(self, "Select documents", "Select one or more documents to preflight locally.")
-            return
-        failures: list[str] = []
-        for row in rows:
-            document = self._documents[row]
-            if not document.is_ready:
-                continue
-            try:
-                self._artifacts[document.path] = extract_document(document)
-            except ExtractionError as error:
-                failures.append(f"{document.path.name}: {error}")
-        self._refresh_document_table()
-        if failures:
-            QMessageBox.warning(self, "Preflight warnings", "\n".join(failures))
+        return item.message or "Ready for vision processing"
 
     def _refresh_provider_state(self) -> None:
         kind = self.provider_combo.currentData()
@@ -571,17 +604,19 @@ class DocumentProcessorWindow(QMainWindow):
         if not any(item.is_ready for item in self._documents):
             QMessageBox.warning(self, "Documents required", "Add at least one supported document.")
             return False
-        mode = ProcessingMode(self.processing_mode_combo.currentData())
-        if mode is ProcessingMode.PDF_IMAGES:
-            non_pdf_documents = [item.path.name for item in self._documents if item.is_ready and item.extension != ".pdf"]
-            if non_pdf_documents:
-                QMessageBox.warning(
-                    self,
-                    "PDF images require PDF documents",
-                    "Image processing is available only for PDFs. Remove or switch the input mode for: "
-                    + ", ".join(non_pdf_documents),
-                )
-                return False
+        mode = self._processing_mode()
+        non_pdf_documents = [item.path.name for item in self._documents if item.is_ready and item.extension != ".pdf"]
+        if non_pdf_documents:
+            QMessageBox.warning(
+                self,
+                "Vision processing requires PDF documents",
+                "Only PDFs can be processed. Remove the following files: " + ", ".join(non_pdf_documents),
+            )
+            return False
+        if mode is ProcessingMode.PDF_MARKDOWN:
+            if show_success:
+                self.queue_status.setText("Batch is valid. Configure Microsoft Foundry to enable processing.")
+            return True
         try:
             output_structure = json.loads(self.output_structure_editor.toPlainText())
         except json.JSONDecodeError as error:
@@ -601,19 +636,26 @@ class DocumentProcessorWindow(QMainWindow):
             QMessageBox.warning(self, "Provider configuration required", self._provider.readiness().message)
             return
         self.process_button.setEnabled(False)
-        self.queue_status.setText("Processing each document in an independent Microsoft Foundry request…")
+        mode = self._processing_mode()
+        if mode is ProcessingMode.PDF_MARKDOWN:
+            self.queue_status.setText("Transcribing each PDF page in an independent Microsoft Foundry request…")
+        else:
+            self.queue_status.setText("Processing each document in an independent Microsoft Foundry request…")
         self.token_usage_label.setText("Calculating batch token usage…")
         self.progress_log.clear()
         threading.Thread(target=self._run_batch, daemon=True).start()
 
     def _run_batch(self) -> None:
         prompt = self.prompt_editor.toPlainText().strip()
-        try:
-            output_structure = json.loads(self.output_structure_editor.toPlainText())
-        except json.JSONDecodeError as error:
-            self.batch_failed.emit(str(error))
-            return
-        mode = ProcessingMode(self.processing_mode_combo.currentData())
+        mode = self._processing_mode()
+        if mode is ProcessingMode.PDF_MARKDOWN:
+            output_structure: dict[str, object] = {}
+        else:
+            try:
+                output_structure = json.loads(self.output_structure_editor.toPlainText())
+            except json.JSONDecodeError as error:
+                self.batch_failed.emit(str(error))
+                return
         ready_documents = [item for item in self._documents if item.is_ready]
         total = len(ready_documents)
         if total == 0:
@@ -637,7 +679,16 @@ class DocumentProcessorWindow(QMainWindow):
             # Token totals accumulate here in this single thread, so no extra locking is required.
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
-                result, usage = future.result()
+                try:
+                    result, usage = future.result()
+                except Exception as error:
+                    result = {
+                        "document": ready_documents[index].path.name,
+                        "input_mode": mode.value,
+                        "status": "failed",
+                        "error": f"Unexpected processing failure ({type(error).__name__}): {error}",
+                    }
+                    usage = {}
                 results[index] = result
                 prompt_tokens += _token_count(usage, "prompt_tokens")
                 completion_tokens += _token_count(usage, "completion_tokens")
@@ -668,37 +719,119 @@ class DocumentProcessorWindow(QMainWindow):
         Returns the per-document result row and its token usage. A single document's
         failure is captured as a ``failed`` result row so the rest of the batch continues.
         """
+        if mode is ProcessingMode.PDF_MARKDOWN:
+            return self._process_pdf_markdown_document(document, prompt)
+
         last_error: Exception | None = None
         for attempt in range(MAX_REQUEST_ATTEMPTS):
             try:
-                if mode is ProcessingMode.PDF_IMAGES:
-                    response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, output_structure)
-                else:
-                    artifact = self._artifacts.get(document.path)
-                    if artifact is None:
-                        artifact = extract_document(document)
-                        self._artifacts[document.path] = artifact
-                    if artifact.status is not ExtractionStatus.COMPLETE or not artifact.content.strip():
-                        return (
-                            {"document": document.path.name, "status": artifact.status.value, "warnings": artifact.warnings},
-                            {},
-                        )
-                    response = self._provider.process_document(artifact.content, prompt, output_structure)
+                self.batch_progress.emit(
+                    f"Processing {document.path.name}: attempt {attempt + 1}/{MAX_REQUEST_ATTEMPTS}."
+                )
+                response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, output_structure)
                 usage = response.pop("usage", {})
                 return (
                     {"document": document.path.name, "input_mode": mode.value, "status": "completed", **response},
                     usage if isinstance(usage, dict) else {},
                 )
-            except ProviderRateLimitError as error:
+            except (ProviderRateLimitError, ProviderTransientError) as error:
                 last_error = error
                 if attempt < MAX_REQUEST_ATTEMPTS - 1:
-                    time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
-            except (ExtractionError, ProviderError, json.JSONDecodeError) as error:
+                    retry_delay = RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                    self.batch_progress.emit(
+                        f"Transient provider failure for {document.path.name}: retrying in {retry_delay:.0f}s."
+                    )
+                    time.sleep(retry_delay)
+            except (PdfRenderingError, ProviderError, json.JSONDecodeError) as error:
                 last_error = error
                 break
         return (
             {"document": document.path.name, "input_mode": mode.value, "status": "failed", "error": str(last_error)},
             {},
+        )
+
+    def _process_pdf_markdown_document(self, document: DocumentItem, prompt: str) -> tuple[dict[str, object], dict[str, object]]:
+        """Transcribe one PDF in ordered, isolated page requests and combine its Markdown output."""
+        try:
+            page_images = render_pdf_pages(document)
+        except PdfRenderingError as error:
+            return (
+                {
+                    "document": document.path.name,
+                    "input_mode": ProcessingMode.PDF_MARKDOWN.value,
+                    "status": "failed",
+                    "error": str(error),
+                },
+                {},
+            )
+
+        page_sections: list[str] = []
+        prompt_tokens = 0
+        completion_tokens = 0
+        cached_prompt_tokens = 0
+        page_count = len(page_images)
+        for page_number, page_image in enumerate(page_images, start=1):
+            response: dict[str, object] | None = None
+            last_error: Exception | None = None
+            for attempt in range(MAX_REQUEST_ATTEMPTS):
+                self.batch_progress.emit(
+                    f"Transcribing {document.path.name}: page {page_number}/{page_count}, "
+                    f"attempt {attempt + 1}/{MAX_REQUEST_ATTEMPTS}."
+                )
+                try:
+                    candidate = self._provider.process_pdf_page_markdown(page_image, prompt)
+                    response = candidate if isinstance(candidate, dict) else None
+                    if response is None:
+                        raise ProviderError("Microsoft Foundry returned an unexpected page-transcription response.")
+                    break
+                except (ProviderRateLimitError, ProviderTransientError) as error:
+                    last_error = error
+                    if attempt < MAX_REQUEST_ATTEMPTS - 1:
+                        retry_delay = RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                        self.batch_progress.emit(
+                            f"Transient provider failure for {document.path.name}, page {page_number}/{page_count}: "
+                            f"retrying in {retry_delay:.0f}s."
+                        )
+                        time.sleep(retry_delay)
+                except ProviderError as error:
+                    last_error = error
+                    break
+            if response is None:
+                message = str(last_error) if last_error is not None else "Page transcription did not return a response."
+                return (
+                    {
+                        "document": document.path.name,
+                        "input_mode": ProcessingMode.PDF_MARKDOWN.value,
+                        "status": "failed",
+                        "error": f"Page {page_number}: {message}",
+                    },
+                    _markdown_usage(prompt_tokens, cached_prompt_tokens, completion_tokens),
+                )
+            markdown = response.get("text")
+            if not isinstance(markdown, str):
+                return (
+                    {
+                        "document": document.path.name,
+                        "input_mode": ProcessingMode.PDF_MARKDOWN.value,
+                        "status": "failed",
+                        "error": f"Page {page_number}: Microsoft Foundry returned non-text Markdown content.",
+                    },
+                    _markdown_usage(prompt_tokens, cached_prompt_tokens, completion_tokens),
+                )
+            page_sections.append(f"## Page {page_number}\n\n{_remove_markdown_code_fence(markdown).strip()}")
+            response_usage = response.get("usage")
+            prompt_tokens += _token_count(response_usage, "prompt_tokens")
+            completion_tokens += _token_count(response_usage, "completion_tokens")
+            cached_prompt_tokens += _cached_token_count(response_usage)
+
+        return (
+            {
+                "document": document.path.name,
+                "input_mode": ProcessingMode.PDF_MARKDOWN.value,
+                "status": "completed",
+                "text": "\n\n".join(page_sections) + "\n",
+            },
+            _markdown_usage(prompt_tokens, cached_prompt_tokens, completion_tokens),
         )
 
     def _on_batch_completed(
@@ -719,11 +852,15 @@ class DocumentProcessorWindow(QMainWindow):
             output_text = self.output_dir_input.text().strip()
             output_dir = Path(output_text) if output_text else None
             output_path = _write_results_file(results, output_dir)
-            csv_output_paths = _write_csv_outputs(results, output_path)
+            batch_results = json.loads(results)
+            if _is_pdf_markdown_batch(batch_results):
+                additional_output_paths = _write_markdown_outputs(batch_results, output_path)
+            else:
+                additional_output_paths = _write_csv_outputs(results, output_path)
         except (OSError, TypeError, json.JSONDecodeError) as error:
             self.queue_status.setText(f"Batch completed, but results could not be written to disk: {error}")
         else:
-            written = ", ".join(str(path) for path in (output_path, *csv_output_paths))
+            written = ", ".join(str(path) for path in (output_path, *additional_output_paths))
             self.queue_status.setText(f"Batch completed. Results written to {written}")
         self._refresh_provider_state()
 
@@ -749,7 +886,7 @@ def main() -> None:
 
 
 def _default_output_dir() -> Path:
-    """Default folder for JSON and CSV results, relative to the current working directory."""
+    """Default folder for JSON, CSV, and Markdown results, relative to the current working directory."""
     return Path.cwd() / "outputs"
 
 
@@ -759,6 +896,54 @@ def _write_results_file(results: str, output_dir: Path | None = None) -> Path:
     output_path = directory / f"document_processor_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     output_path.write_text(results, encoding="utf-8")
     return output_path
+
+
+def _remove_markdown_code_fence(markdown: str) -> str:
+    """Remove one outer Markdown fence that a provider returned despite the transcription instruction."""
+    lines = markdown.strip().splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1])
+    return markdown
+
+
+def _markdown_usage(prompt_tokens: int, cached_prompt_tokens: int, completion_tokens: int) -> dict[str, object]:
+    """Return accumulated page-level usage in the same shape used by the batch cost display."""
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached_prompt_tokens},
+    }
+
+
+def _is_pdf_markdown_batch(batch_results: list[object]) -> bool:
+    """Identify batches that use the page-by-page PDF Markdown processing mode."""
+    return any(
+        isinstance(batch_result, dict)
+        and batch_result.get("input_mode") == ProcessingMode.PDF_MARKDOWN.value
+        for batch_result in batch_results
+    )
+
+
+def _write_markdown_outputs(batch_results: list[object], json_output_path: Path) -> tuple[Path, ...]:
+    """Write one consolidated Markdown file for every successfully transcribed PDF in a batch."""
+    output_paths: list[Path] = []
+    for source_index, batch_result in enumerate(batch_results, start=1):
+        if not isinstance(batch_result, dict):
+            continue
+        if batch_result.get("input_mode") != ProcessingMode.PDF_MARKDOWN.value:
+            continue
+        if batch_result.get("status") != "completed":
+            continue
+        markdown = batch_result.get("text")
+        if not isinstance(markdown, str):
+            continue
+        document_name = batch_result.get("document")
+        source_stem = Path(document_name).stem if isinstance(document_name, str) and document_name else "document"
+        safe_stem = "".join(character if character.isalnum() or character in "-_" else "_" for character in source_stem).strip("._")
+        output_path = json_output_path.with_name(f"{json_output_path.stem}_{source_index:03d}_{safe_stem or 'document'}.md")
+        output_path.write_text(markdown, encoding="utf-8")
+        output_paths.append(output_path)
+    return tuple(output_paths)
 
 
 def _token_count(usage: object, field_name: str) -> int:

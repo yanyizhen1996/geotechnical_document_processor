@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import base64
 from dataclasses import dataclass
+from http.client import HTTPException
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -30,6 +31,10 @@ class ProviderRateLimitError(ProviderRequestError):
     """The provider throttled the request (HTTP 429/503); the caller may retry after a delay."""
 
 
+class ProviderTransientError(ProviderRequestError):
+    """A transient network or read failure for which the caller may retry after a delay."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderReadiness:
     provider: ProviderKind
@@ -47,11 +52,17 @@ class MicrosoftFoundryConfiguration:
     api_version: str = ""
 
 
-MAX_ADDITIONAL_CONTEXT_CHARACTERS = 100_000
 DEFAULT_FOUNDRY_API_VERSION = "2024-05-01-preview"
+FOUNDRY_REQUEST_TIMEOUT_SECONDS = 120
 FALLBACK_FOUNDRY_API_VERSIONS = (
     "2025-04-01-preview",
     "2024-05-01-preview",
+)
+PDF_MARKDOWN_TRANSCRIPTION_INSTRUCTIONS = (
+    "Digitize the supplied PDF page into faithful GitHub-Flavored Markdown. Transcribe every visible textual "
+    "and tabular element in natural reading order. Preserve wording, values, headings, lists, form labels, and "
+    "tables. Do not summarize, normalize, infer, omit, or add commentary. Mark unreadable text as [illegible]. "
+    "Return Markdown only; do not wrap it in a code fence."
 )
 
 
@@ -63,12 +74,12 @@ class DocumentProvider(ABC):
         """Return setup readiness without exposing credentials."""
 
     @abstractmethod
-    def process_document(self, content: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
-        """Process one document only; no cross-document state is permitted."""
-
-    @abstractmethod
     def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         """Process the rendered pages of one PDF only; no cross-document state is permitted."""
+
+    @abstractmethod
+    def process_pdf_page_markdown(self, page_image: bytes, prompt: str) -> dict[str, Any]:
+        """Transcribe one rendered PDF page into Markdown without cross-page context."""
 
 
 class MicrosoftFoundryProvider(DocumentProvider):
@@ -100,24 +111,6 @@ class MicrosoftFoundryProvider(DocumentProvider):
             message,
         )
 
-    def process_document(self, content: str, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
-        if not self.readiness().ready:
-            raise ProviderNotReadyError(self.readiness().message)
-        if len(content) > MAX_ADDITIONAL_CONTEXT_CHARACTERS:
-            raise ProviderRequestError(
-                "Document extraction exceeds the current 100,000-character request limit; document-local chunking is not implemented yet."
-            )
-        assert self._configuration is not None
-
-        response = self._post_json(
-            self._configuration.endpoint,
-            _build_foundry_payload(self._configuration.endpoint, self._configuration.model_id, prompt, schema, content),
-        )
-        return {
-            "text": _extract_foundry_text(response),
-            "usage": _extract_usage(response),
-        }
-
     def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         if not self.readiness().ready:
             raise ProviderNotReadyError(self.readiness().message)
@@ -140,6 +133,27 @@ class MicrosoftFoundryProvider(DocumentProvider):
             "usage": _extract_usage(response),
         }
 
+    def process_pdf_page_markdown(self, page_image: bytes, prompt: str) -> dict[str, Any]:
+        if not self.readiness().ready:
+            raise ProviderNotReadyError(self.readiness().message)
+        if not page_image:
+            raise ProviderRequestError("The PDF page did not produce an image.")
+        assert self._configuration is not None
+
+        response = self._post_json(
+            self._configuration.endpoint,
+            _build_foundry_markdown_page_payload(
+                self._configuration.endpoint,
+                self._configuration.model_id,
+                prompt,
+                page_image,
+            ),
+        )
+        return {
+            "text": _extract_foundry_text(response),
+            "usage": _extract_usage(response),
+        }
+
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         assert self._configuration is not None
         normalized_endpoint = _normalize_foundry_endpoint(endpoint, self._configuration.api_version.strip())
@@ -154,7 +168,7 @@ class MicrosoftFoundryProvider(DocumentProvider):
             method="POST",
         )
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=FOUNDRY_REQUEST_TIMEOUT_SECONDS) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
@@ -199,8 +213,8 @@ class MicrosoftFoundryProvider(DocumentProvider):
                     f"Microsoft Foundry throttled the request ({error.code}): {detail}"
                 ) from error
             raise ProviderRequestError(f"Microsoft Foundry request failed ({error.code}): {detail}") from error
-        except (URLError, TimeoutError) as error:
-            raise ProviderRequestError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
+        except (URLError, OSError, HTTPException) as error:
+            raise ProviderTransientError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
         except json.JSONDecodeError as error:
             raise ProviderRequestError("Microsoft Foundry endpoint returned a non-JSON response.") from error
         if not isinstance(data, dict):
@@ -246,23 +260,6 @@ def _normalize_foundry_endpoint(endpoint: str, api_version: str = "") -> str:
     return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, urlencode(query), parsed.fragment))
 
 
-def _build_foundry_payload(endpoint: str, model_id: str, prompt: str, schema: dict[str, Any], content: str) -> dict[str, Any]:
-    """Build payloads compatible with Foundry and Azure OpenAI-style endpoints."""
-    payload: dict[str, Any] = {
-        "messages": [
-            {
-                "role": "system",
-                "content": "Use only the provided document content in this request. Do not rely on prior turns.",
-            },
-            {"role": "user", "content": _build_document_prompt(prompt, schema, content)},
-        ],
-    }
-    # Deployment-style Azure OpenAI endpoints encode model/deployment in the URL.
-    if "/openai/deployments/" not in endpoint.lower():
-        payload["model"] = model_id
-    return payload
-
-
 def _build_foundry_image_payload(
     endpoint: str,
     model_id: str,
@@ -274,11 +271,7 @@ def _build_foundry_image_payload(
     content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": _build_document_prompt(
-                prompt,
-                schema,
-                "The document is supplied as page images below. Use only those images.",
-            ),
+            "text": _build_structured_vision_prompt(prompt, schema),
         }
     ]
     content.extend(
@@ -302,14 +295,46 @@ def _build_foundry_image_payload(
     return payload
 
 
-def _build_document_prompt(prompt: str, schema: dict[str, Any], content: str) -> str:
-    """Build a self-contained, document-specific request without earlier results."""
+def _build_foundry_markdown_page_payload(
+    endpoint: str,
+    model_id: str,
+    prompt: str,
+    page_image: bytes,
+) -> dict[str, Any]:
+    """Build one vision request that returns a faithful Markdown transcription of one PDF page."""
+    instructions = PDF_MARKDOWN_TRANSCRIPTION_INSTRUCTIONS
+    if prompt.strip():
+        instructions = f"{instructions}\n\nAdditional page instructions:\n{prompt.strip()}"
+    payload: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "system",
+                "content": "Use only the supplied document page in this request. Do not rely on prior turns.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instructions},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{base64.b64encode(page_image).decode('ascii')}"},
+                    },
+                ],
+            },
+        ],
+    }
+    if "/openai/deployments/" not in endpoint.lower():
+        payload["model"] = model_id
+    return payload
+
+
+def _build_structured_vision_prompt(prompt: str, schema: dict[str, Any]) -> str:
+    """Build a self-contained JSON extraction instruction for PDF page images."""
     return (
         f"Task: {prompt}\n\n"
         "Return valid JSON only, matching this output structure exactly:\n"
         f"{json.dumps(schema, ensure_ascii=False)}\n\n"
-        "Document content:\n"
-        f"{content}"
+        "The document is supplied as page images below. Use only those images."
     )
 
 
@@ -370,7 +395,7 @@ def _retry_foundry_versions(
             method="POST",
         )
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=FOUNDRY_REQUEST_TIMEOUT_SECONDS) as response:
                 data = json.loads(response.read().decode("utf-8"))
             if isinstance(data, dict):
                 return data
@@ -378,8 +403,8 @@ def _retry_foundry_versions(
             detail = error.read().decode("utf-8", errors="replace")
             if error.code != 400 or not _is_api_version_not_supported(detail):
                 raise ProviderRequestError(f"Microsoft Foundry request failed ({error.code}): {detail}") from error
-        except (URLError, TimeoutError) as error:
-            raise ProviderRequestError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
+        except (URLError, OSError, HTTPException) as error:
+            raise ProviderTransientError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
         except json.JSONDecodeError as error:
             raise ProviderRequestError("Microsoft Foundry endpoint returned a non-JSON response.") from error
     return None

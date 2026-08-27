@@ -1,15 +1,14 @@
 import pytest
 
 from document_processor.providers import (
-    MAX_ADDITIONAL_CONTEXT_CHARACTERS,
     MicrosoftFoundryProvider,
     MicrosoftFoundryConfiguration,
     ProviderNotReadyError,
-    ProviderRequestError,
+    ProviderTransientError,
     _is_api_version_not_supported,
     _is_deployment_not_found,
     _build_foundry_image_payload,
-    _build_foundry_payload,
+    _build_foundry_markdown_page_payload,
     _normalize_foundry_endpoint,
 )
 
@@ -27,46 +26,7 @@ def test_microsoft_foundry_refuses_processing_until_ready() -> None:
     provider = MicrosoftFoundryProvider()
 
     with pytest.raises(ProviderNotReadyError):
-        provider.process_document("content", "extract", {"type": "object"})
-
-
-def test_microsoft_foundry_sends_configured_request_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = MicrosoftFoundryProvider(
-        MicrosoftFoundryConfiguration(
-            endpoint="https://example.foundry.microsoft.com/chat/completions?api-version=2024-05-01-preview",
-            api_key="test-key",
-            model_id="gpt-4.1-mini",
-        )
-    )
-    calls: list[tuple[str, dict[str, object]]] = []
-
-    def fake_post(endpoint: str, payload: dict[str, object]) -> dict[str, object]:
-        calls.append((endpoint, payload))
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": '{"pi": 12}'
-                    }
-                }
-            ],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 23, "total_tokens": 123},
-        }
-
-    monkeypatch.setattr(provider, "_post_json", fake_post)
-
-    result = provider.process_document("document-only content", "Extract PI", {"type": "object"})
-
-    assert result["text"] == '{"pi": 12}'
-    assert result["usage"] == {"prompt_tokens": 100, "completion_tokens": 23, "total_tokens": 123}
-    assert calls[0][0].startswith("https://example.foundry.microsoft.com")
-    payload = calls[0][1]
-    assert payload["model"] == "gpt-4.1-mini"
-    assert "temperature" not in payload
-    assert len(payload["messages"]) == 2
-    assert payload["messages"][1]["role"] == "user"
-    assert "Extract PI" in payload["messages"][1]["content"]
-    assert "document-only content" in payload["messages"][1]["content"]
+        provider.process_pdf_images((b"page",), "extract", {"type": "object"})
 
 
 def test_microsoft_foundry_sends_one_multimodal_request_per_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,7 +58,44 @@ def test_microsoft_foundry_sends_one_multimodal_request_per_pdf(monkeypatch: pyt
     ]
 
 
-def test_microsoft_foundry_rejects_oversized_context() -> None:
+def test_microsoft_foundry_sends_one_markdown_request_per_pdf_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = MicrosoftFoundryProvider(
+        MicrosoftFoundryConfiguration(
+            endpoint="https://example.foundry.microsoft.com/chat/completions?api-version=2024-05-01-preview",
+            api_key="test-key",
+            model_id="gpt-4.1-mini",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_post(endpoint: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((endpoint, payload))
+        return {
+            "choices": [{"message": {"content": "# Page title"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 23, "total_tokens": 123},
+        }
+
+    monkeypatch.setattr(provider, "_post_json", fake_post)
+
+    result = provider.process_pdf_page_markdown(b"page-one", "Preserve handwritten annotations.")
+
+    assert result == {
+        "text": "# Page title",
+        "usage": {"prompt_tokens": 100, "completion_tokens": 23, "total_tokens": 123},
+    }
+    assert len(calls) == 1
+    payload = calls[0][1]
+    assert payload["model"] == "gpt-4.1-mini"
+    content = payload["messages"][1]["content"]
+    assert len(content) == 2
+    assert content[0]["type"] == "text"
+    assert "GitHub-Flavored Markdown" in content[0]["text"]
+    assert "Preserve handwritten annotations." in content[0]["text"]
+    assert "Return valid JSON only" not in content[0]["text"]
+    assert content[1]["image_url"]["url"] == "data:image/png;base64,cGFnZS1vbmU="
+
+
+def test_microsoft_foundry_marks_read_timeouts_as_transient(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = MicrosoftFoundryProvider(
         MicrosoftFoundryConfiguration(
             endpoint="https://example.foundry.microsoft.com/chat/completions?api-version=2024-05-01-preview",
@@ -107,8 +104,31 @@ def test_microsoft_foundry_rejects_oversized_context() -> None:
         )
     )
 
-    with pytest.raises(ProviderRequestError, match="chunking"):
-        provider.process_document("x" * (MAX_ADDITIONAL_CONTEXT_CHARACTERS + 1), "Extract", {"type": "object"})
+    def timeout_request(*_arguments: object, **_kwargs: object) -> None:
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr("document_processor.providers.urlopen", timeout_request)
+
+    with pytest.raises(ProviderTransientError, match="read operation timed out"):
+        provider.process_pdf_page_markdown(b"page", "")
+
+
+def test_microsoft_foundry_marks_connection_resets_as_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = MicrosoftFoundryProvider(
+        MicrosoftFoundryConfiguration(
+            endpoint="https://example.foundry.microsoft.com/chat/completions?api-version=2024-05-01-preview",
+            api_key="test-key",
+            model_id="gpt-4.1-mini",
+        )
+    )
+
+    def reset_connection(*_arguments: object, **_kwargs: object) -> None:
+        raise ConnectionResetError("The connection was reset by the remote host")
+
+    monkeypatch.setattr("document_processor.providers.urlopen", reset_connection)
+
+    with pytest.raises(ProviderTransientError, match="connection was reset"):
+        provider.process_pdf_page_markdown(b"page", "")
 
 
 def test_normalize_foundry_models_base_appends_chat_path_and_api_version() -> None:
@@ -167,19 +187,6 @@ def test_deployment_not_found_detection_handles_provider_message() -> None:
     assert _is_deployment_not_found(detail)
 
 
-def test_build_payload_omits_model_for_deployment_style_endpoints() -> None:
-    payload = _build_foundry_payload(
-        "https://example.openai.azure.com/openai/deployments/my-deployment/chat/completions?api-version=2024-02-01",
-        "ignored-model-id",
-        "Extract PI",
-        {"type": "object"},
-        "document text",
-    )
-
-    assert "model" not in payload
-    assert payload["messages"][1]["role"] == "user"
-
-
 def test_build_image_payload_omits_model_for_deployment_style_endpoints() -> None:
     payload = _build_foundry_image_payload(
         "https://example.openai.azure.com/openai/deployments/my-deployment/chat/completions?api-version=2024-02-01",
@@ -191,3 +198,18 @@ def test_build_image_payload_omits_model_for_deployment_style_endpoints() -> Non
 
     assert "model" not in payload
     assert payload["messages"][1]["content"][1]["type"] == "image_url"
+
+
+def test_build_markdown_page_payload_omits_model_for_deployment_style_endpoints() -> None:
+    payload = _build_foundry_markdown_page_payload(
+        "https://example.openai.azure.com/openai/deployments/my-deployment/chat/completions?api-version=2024-02-01",
+        "ignored-model-id",
+        "",
+        b"page",
+    )
+
+    assert "model" not in payload
+    content = payload["messages"][1]["content"]
+    assert content[0]["type"] == "text"
+    assert "GitHub-Flavored Markdown" in content[0]["text"]
+    assert content[1]["type"] == "image_url"

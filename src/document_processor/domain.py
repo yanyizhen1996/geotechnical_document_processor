@@ -14,8 +14,8 @@ class ProviderKind(StrEnum):
 
 
 class ProcessingMode(StrEnum):
-    TEXT = "text"
     PDF_IMAGES = "pdf_images"
+    PDF_MARKDOWN = "pdf_markdown"
 
 
 class DocumentStatus(StrEnum):
@@ -26,13 +26,7 @@ class DocumentStatus(StrEnum):
     ERROR = "error"
 
 
-class ExtractionStatus(StrEnum):
-    COMPLETE = "complete"
-    REVIEW_REQUIRED = "review_required"
-    UNAVAILABLE = "unavailable"
-
-
-SUPPORTED_EXTENSIONS = frozenset({".pdf", ".csv", ".xlsx", ".docx", ".doc"})
+SUPPORTED_EXTENSIONS = frozenset({".pdf"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,21 +42,6 @@ class DocumentItem:
     @property
     def is_ready(self) -> bool:
         return self.status is DocumentStatus.READY
-
-
-@dataclass(frozen=True, slots=True)
-class ExtractionArtifact:
-    """In-memory content and provenance for one source document."""
-
-    document: DocumentItem
-    content: str
-    source_locations: tuple[str, ...]
-    warnings: tuple[str, ...] = ()
-    status: ExtractionStatus = ExtractionStatus.COMPLETE
-
-    @property
-    def is_usable(self) -> bool:
-        return self.status is not ExtractionStatus.UNAVAILABLE
 
 
 @dataclass(frozen=True, slots=True)
