@@ -1,11 +1,10 @@
-"""Versioned, provider-independent domain records for document batches."""
+"""Provider-independent domain records for document batches."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 
 class ProviderKind(StrEnum):
@@ -20,7 +19,6 @@ class ProcessingMode(StrEnum):
 
 class DocumentStatus(StrEnum):
     READY = "ready"
-    EXCLUDED = "excluded"
     UNSUPPORTED = "unsupported"
     DUPLICATE = "duplicate"
     ERROR = "error"
@@ -42,35 +40,6 @@ class DocumentItem:
     @property
     def is_ready(self) -> bool:
         return self.status is DocumentStatus.READY
-
-
-@dataclass(frozen=True, slots=True)
-class PromptContract:
-    task_prompt: str
-    output_schema: dict[str, Any]
-    version: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderConfiguration:
-    kind: ProviderKind = ProviderKind.MICROSOFT_FOUNDRY
-    model: str = "foundry-model-id"
-    openai_enabled: bool = False
-
-    def is_enabled(self) -> bool:
-        return self.kind is ProviderKind.MICROSOFT_FOUNDRY or self.openai_enabled
-
-
-@dataclass(frozen=True, slots=True)
-class BatchSpec:
-    documents: tuple[DocumentItem, ...]
-    contract: PromptContract
-    provider: ProviderConfiguration = field(default_factory=ProviderConfiguration)
-    schema_version: int = 1
-
-    @property
-    def ready_document_count(self) -> int:
-        return sum(document.is_ready for document in self.documents)
 
 
 def inspect_document(path: str | Path, seen_paths: set[Path] | None = None) -> DocumentItem:

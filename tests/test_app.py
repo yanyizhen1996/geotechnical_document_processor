@@ -10,23 +10,25 @@ from PySide6.QtWidgets import QApplication, QGroupBox, QScrollArea
 import pytest
 
 from document_processor.app import (
-    SOIL_LAB_SUMMARY_PROMPT,
+    DocumentDropGroupBox,
+    DocumentProcessorWindow,
+    _calculate_batch_cost,
+    _write_csv_outputs,
+    _write_markdown_outputs,
+    _write_results_file,
+    _write_soil_lab_summary_csv_file,
+)
+from document_processor.domain import ProcessingMode, inspect_document
+from document_processor.providers import ProviderRequestError, ProviderTransientError
+from document_processor.templates import (
     BOREHOLE_LOG_TEMPLATE_1_KEY,
     BOREHOLE_LOG_TEMPLATE_1_PROMPT,
     BOREHOLE_LOG_TEMPLATE_2_KEY,
     BOREHOLE_LOG_TEMPLATE_2_PROMPT,
     PDF_MARKDOWN_PROMPT,
     PDF_MARKDOWN_TEMPLATE_KEY,
-    DocumentDropGroupBox,
-    DocumentProcessorWindow,
-    _calculate_batch_cost,
-    _write_csv_file,
-    _write_csv_outputs,
-    _write_markdown_outputs,
-    _write_results_file,
+    SOIL_LAB_SUMMARY_PROMPT,
 )
-from document_processor.domain import ProcessingMode, inspect_document
-from document_processor.providers import ProviderRequestError, ProviderTransientError
 
 
 def _write_pdf(path: Path, page_count: int) -> None:
@@ -76,7 +78,7 @@ def test_write_csv_file_flattens_each_sample_result(tmp_path) -> None:
     )
     json_output_path = _write_results_file(results, tmp_path)
 
-    csv_output_path = _write_csv_file(results, json_output_path)
+    csv_output_path = _write_soil_lab_summary_csv_file(json.loads(results), json_output_path)
 
     with csv_output_path.open(encoding="utf-8-sig", newline="") as source:
         rows = list(csv.DictReader(source))
@@ -246,7 +248,7 @@ def test_write_csv_outputs_splits_borehole_samples_and_soil_descriptions(tmp_pat
     )
     json_output_path = _write_results_file(results, tmp_path)
 
-    csv_paths = _write_csv_outputs(results, json_output_path)
+    csv_paths = _write_csv_outputs(json.loads(results), json_output_path)
 
     samples_path = json_output_path.with_name(f"{json_output_path.stem}_samples.csv")
     soil_path = json_output_path.with_name(f"{json_output_path.stem}_soil_descriptions.csv")
@@ -342,7 +344,7 @@ def test_write_csv_outputs_flattens_geotech_lab_reports_with_metadata(tmp_path) 
     )
     json_output_path = _write_results_file(results, tmp_path)
 
-    csv_paths = _write_csv_outputs(results, json_output_path)
+    csv_paths = _write_csv_outputs(json.loads(results), json_output_path)
 
     assert csv_paths == (json_output_path.with_suffix(".csv"),)
     with csv_paths[0].open(encoding="utf-8-sig", newline="") as source:
@@ -418,7 +420,7 @@ def test_geotech_lab_report_merges_headers_differing_only_by_punctuation(tmp_pat
     )
     json_output_path = _write_results_file(results, tmp_path)
 
-    csv_paths = _write_csv_outputs(results, json_output_path)
+    csv_paths = _write_csv_outputs(json.loads(results), json_output_path)
 
     with csv_paths[0].open(encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)

@@ -7,8 +7,10 @@ import json
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -51,197 +53,18 @@ from .providers import (
     ProviderRateLimitError,
     ProviderTransientError,
 )
+from .templates import (
+    BOREHOLE_LOG_TEMPLATE_1_KEY,
+    BOREHOLE_LOG_TEMPLATE_2_KEY,
+    EXTRACTION_TEMPLATES,
+    GEOTECH_LAB_REPORT_TEMPLATE_KEY,
+    PDF_MARKDOWN_PROMPT,
+    PDF_MARKDOWN_TEMPLATE_KEY,
+    SOIL_LAB_SUMMARY_TEMPLATE_KEY,
+)
 
 
-SOIL_LAB_SUMMARY_TEMPLATE_KEY = "soil_lab_summary"
-SOIL_LAB_SUMMARY_PROMPT = (
-    "Review the soil laboratory report and extract only the information needed for a geotechnical laboratory "
-    "summary table. Set test_type to the reported laboratory test or standard. Add one samples item for each "
-    "tested sample, with its borehole or sample location, sample ID, depth, and only its final reportable test "
-    "results. Borehole or sample locations are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', "
-    "'P-3', or 'TP-12', while sample IDs typically contain an 'S' or 'MC', such as 'S-15' or 'MC-2'; use these "
-    "conventions to assign each identifier to the correct field. "
-    "Include classification only when it is reported as a final test result. Do not extract client, "
-    "project details, report dates, personnel, intermediate weights, calculations, narrative summaries, or other "
-    "metadata. Preserve reported values and units. Use null for unavailable sample identifiers and an empty results "
-    "list only when a tested sample has no reportable final results."
-)
-SOIL_LAB_SUMMARY_STRUCTURE = {
-    "type": "object",
-    "properties": {
-        "test_type": {"type": ["string", "null"], "description": "Reported laboratory test or standard"},
-        "samples": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "borehole": {"type": ["string", "null"], "description": "Borehole or sample location"},
-                    "sample_id": {"type": ["string", "null"], "description": "Reported sample identifier"},
-                    "depth": {"type": ["string", "null"], "description": "Reported depth or depth interval"},
-                    "key_results": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": ["string", "null"]},
-                                "value": {"type": ["string", "null"]},
-                                "unit": {"type": ["string", "null"]},
-                            },
-                            "required": ["name", "value", "unit"],
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-                "required": ["borehole", "sample_id", "depth", "key_results"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["test_type", "samples"],
-    "additionalProperties": False,
-}
-BOREHOLE_LOG_TEMPLATE_1_KEY = "borehole_log_standard_1"
-BOREHOLE_LOG_TEMPLATE_1_PROMPT = (
-    "Digitize this borehole log page into structured data. Set borehole_id to the borehole identifier that labels "
-    "the log; borehole identifiers are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', 'P-3', or "
-    "'TP-12'. This identifier "
-    "applies to the whole page. Set surface_elevation to the reported ground surface elevation exactly as written, or "
-    "null when none is shown. Determine the single depth unit used on the log (for example 'ft' or 'm') and set "
-    "depth_unit to it; record every top_depth and bottom_depth as a plain number in that unit, with no unit suffix. "
-    "Depths are shown on a vertical depth scale along the left edge and are usually not printed for each interval, so "
-    "read each interval's top and bottom by aligning the edges of its sample marker or material-graphics band to that "
-    "scale, using the numbered foot marks and their minor tick subdivisions to interpolate as precisely as you can. A "
-    "sample interval is the vertical extent of its marker in the sample-location column; a soil stratum is the vertical "
-    "extent of its band in the material-graphics or description column. Ensure top_depth is less than bottom_depth for "
-    "each interval. Add one samples item for each sampled interval, with its sample_id and the top_depth and "
-    "bottom_depth of its interval. Sample IDs typically contain an 'S' or 'MC', such as 'S-4' or 'MC-2'. Set blow_count to the reported "
-    "blow count as text: when the log shows raw per-increment drive counts, join them with single spaces (for example "
-    "'8 8 9'); when the log shows a single number, use it as written; set blow_count to null when a sample has no blow "
-    "count. Add one soil_descriptions item for each described stratum, with its top_depth, bottom_depth, and "
-    "description text; strata boundaries are independent of the sample intervals. Preserve reported values exactly, "
-    "other than normalizing depths as described. Do not extract client, project, contractor, dates, personnel, "
-    "equipment, drilling method, water levels, narrative notes, or other metadata unless it is one of the fields "
-    "above. Use null for any unavailable field and an empty list only when the log has no samples or no soil "
-    "descriptions."
-)
-BOREHOLE_LOG_STRUCTURE = {
-    "type": "object",
-    "properties": {
-        "borehole_id": {"type": ["string", "null"], "description": "Borehole identifier for the whole page, as reported"},
-        "surface_elevation": {"type": ["string", "null"], "description": "Reported ground surface elevation, as written"},
-        "depth_unit": {"type": ["string", "null"], "description": "Single depth unit used across the log, e.g. 'ft' or 'm'"},
-        "samples": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "sample_id": {"type": ["string", "null"], "description": "Sample identifier; typically contains 'S'"},
-                    "top_depth": {"type": ["string", "null"], "description": "Top of the sample interval as a plain number in depth_unit, no unit suffix"},
-                    "bottom_depth": {"type": ["string", "null"], "description": "Bottom of the sample interval as a plain number in depth_unit, no unit suffix"},
-                    "blow_count": {"type": ["string", "null"], "description": "Reported blow count as text: space-separated raw drives like '8 8 9', or a single value; null if none"},
-                },
-                "required": ["sample_id", "top_depth", "bottom_depth", "blow_count"],
-                "additionalProperties": False,
-            },
-        },
-        "soil_descriptions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "top_depth": {"type": ["string", "null"], "description": "Top of the described stratum as a plain number in depth_unit, no unit suffix"},
-                    "bottom_depth": {"type": ["string", "null"], "description": "Bottom of the described stratum as a plain number in depth_unit, no unit suffix"},
-                    "description": {"type": ["string", "null"], "description": "Soil or material description for the interval"},
-                },
-                "required": ["top_depth", "bottom_depth", "description"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["borehole_id", "surface_elevation", "depth_unit", "samples", "soil_descriptions"],
-    "additionalProperties": False,
-}
-BOREHOLE_LOG_TEMPLATE_2_KEY = "borehole_log_standard_2"
-BOREHOLE_LOG_TEMPLATE_2_PROMPT = (
-    "Digitize this borehole log page into structured data. Set borehole_id to the borehole identifier that labels "
-    "the log; borehole identifiers are typically labelled with a 'B' or 'P', such as 'B-13', 'PB-13', 'P-3', or "
-    "'TP-12'. This identifier applies to the whole page. Set surface_elevation to the reported ground surface "
-    "elevation exactly as written, or null "
-    "when none is shown. Determine the single depth unit used on the log (for example 'ft' or 'm') and set "
-    "depth_unit to it; record every top_depth and bottom_depth as a plain number in that unit, with no unit suffix. "
-    "Sample interval depths are shown on a vertical depth scale and are usually not printed for each interval, so "
-    "read each interval's top and bottom by aligning the edges of its sample marker or material-graphics band to "
-    "that scale and interpolate as precisely as possible. A sample interval is the vertical extent of its marker in "
-    "the samples column; a soil stratum is the vertical extent of its band in the material-graphics or description "
-    "column. Ensure top_depth is less than bottom_depth for each interval. Add one samples item for each sampled "
-    "interval, with its sample_id and the top_depth and bottom_depth of its interval. Sample IDs typically contain "
-    "an 'S' or 'MC', such as 'S-4' or 'MC-2'. Blow counts are shown graphically in a zone on the right side of the "
-    "log, with the horizontal blow-count scale displayed at the top of that zone. At each sample depth, a triangle "
-    "marks the blow count. Align the triangle marker to the horizontal scale at the top of the zone and record its "
-    "inferred value as blow_count, even when no ordinary numeric value is printed. Values at or above 50 blows per "
-    "6 inches may instead be printed as a refusal notation, such as '50/4\"'; preserve that notation exactly. Set "
-    "blow_count to null only when neither a readable triangle marker nor a printed refusal notation is present. Add "
-    "one soil_descriptions item for each described stratum, with its top_depth, "
-    "bottom_depth, and description text; strata boundaries are independent of the sample intervals. Preserve "
-    "reported values exactly, other than normalizing depths as described. Do not extract client, project, contractor, "
-    "dates, personnel, equipment, drilling method, water levels, narrative notes, or other metadata unless it is "
-    "one of the fields above. Use null for any unavailable field and an empty list only when the log has no samples "
-    "or no soil descriptions."
-)
-GEOTECH_LAB_REPORT_TEMPLATE_KEY = "geotech_lab_report"
-GEOTECH_LAB_REPORT_PROMPT = (
-    "This is a single-page geotechnical laboratory report (for example an R-value, resistivity, thermal "
-    "conductivity, or compaction report). Extract two things: the report metadata and the one primary results "
-    "table. Metadata: set test_type to the reported test name or ASTM/standard designation (for example "
-    "'Resistance R-Value and Expansion Pressure - ASTM D2844' or 'Thermal Conductivity - ASTM D5334'); set "
-    "location to the boring or sample location (typically labelled with a 'B' or 'P', such as 'PB-1' or 'P-3'); "
-    "set sample_number to the reported sample or specimen number; set project_number, project, and report_date "
-    "to their reported values; set summary to any single-line headline result (for example "
-    "'R-value at 300 psi exudation pressure = 64.1'), or null when none. The primary results table is the main "
-    "numeric per-specimen results table (the block of measured test values), not a chart and not a label box. "
-    "Set result_columns to that table's column headers in left-to-right order, exactly as printed, joining a "
-    "header that wraps onto several lines into one string. Set result_rows to its data rows top-to-bottom, where "
-    "each row is a list of cell values aligned one-to-one with result_columns; use null for an empty cell and "
-    "keep every value exactly as printed, including units and decimals. Do NOT treat the 'Sample Information', "
-    "'Soil Parameters', 'Test Parameters', client/project heading boxes, personnel boxes, remarks, logos, page "
-    "headers/footers, or the plotted chart as the results table. Do not invent, reorder, summarize, or calculate "
-    "values, and use null for any metadata field that is not shown."
-)
-GEOTECH_LAB_REPORT_STRUCTURE = {
-    "type": "object",
-    "properties": {
-        "test_type": {"type": ["string", "null"], "description": "Reported test name or ASTM/standard designation"},
-        "location": {"type": ["string", "null"], "description": "Boring or sample location, e.g. 'PB-1'"},
-        "sample_number": {"type": ["string", "null"], "description": "Reported sample or specimen number"},
-        "project_number": {"type": ["string", "null"], "description": "Reported project number"},
-        "project": {"type": ["string", "null"], "description": "Reported project name"},
-        "report_date": {"type": ["string", "null"], "description": "Reported report or test date, as written"},
-        "summary": {"type": ["string", "null"], "description": "Single-line headline result, or null"},
-        "result_columns": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Primary results table column headers, left-to-right, exactly as printed",
-        },
-        "result_rows": {
-            "type": "array",
-            "items": {
-                "type": "array",
-                "items": {"type": ["string", "null"]},
-            },
-            "description": "Primary results table data rows; each row aligns one-to-one with result_columns",
-        },
-    },
-    "required": ["test_type", "location", "sample_number", "result_columns", "result_rows"],
-    "additionalProperties": False,
-}
-PDF_MARKDOWN_TEMPLATE_KEY = "pdf_markdown"
-PDF_MARKDOWN_PROMPT = "Preserve all visible content faithfully, including tables, handwriting, and form fields."
-EXTRACTION_TEMPLATES: dict[str, tuple[str, dict[str, object]]] = {
-    SOIL_LAB_SUMMARY_TEMPLATE_KEY: (SOIL_LAB_SUMMARY_PROMPT, SOIL_LAB_SUMMARY_STRUCTURE),
-    GEOTECH_LAB_REPORT_TEMPLATE_KEY: (GEOTECH_LAB_REPORT_PROMPT, GEOTECH_LAB_REPORT_STRUCTURE),
-    BOREHOLE_LOG_TEMPLATE_1_KEY: (BOREHOLE_LOG_TEMPLATE_1_PROMPT, BOREHOLE_LOG_STRUCTURE),
-    BOREHOLE_LOG_TEMPLATE_2_KEY: (BOREHOLE_LOG_TEMPLATE_2_PROMPT, BOREHOLE_LOG_STRUCTURE),
-}
+# The model picker lists these models in this order.
 MODEL_PRICING_PER_MILLION_TOKENS = {
     "gpt-5-mini": {"input": 0.28, "cached_input": 0.03, "output": 2.20},
     "gpt-5.4-mini": {"input": 0.83, "cached_input": 0.09, "output": 4.95},
@@ -265,10 +88,7 @@ class DocumentDropGroupBox(QGroupBox):
         self.setAcceptDrops(True)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        self.dragMoveEvent(event)
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         if event.mimeData().hasUrls():
@@ -392,7 +212,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.contract_template_combo.currentIndexChanged.connect(self._on_template_selected)
         mode_layout.addRow("Extraction template", self.contract_template_combo)
         prompt_layout.addLayout(mode_layout)
-        self.prompt_instruction_label = QLabel("Task instructions (applied independently to every document)")
+        self.prompt_instruction_label = QLabel()
         prompt_layout.addWidget(self.prompt_instruction_label)
         self.prompt_editor = QPlainTextEdit()
         self.prompt_editor.setPlaceholderText("Describe the information to identify in each document.")
@@ -422,9 +242,7 @@ class DocumentProcessorWindow(QMainWindow):
         self.endpoint_input.textChanged.connect(self._refresh_provider_state)
         provider_layout.addRow("Endpoint", self.endpoint_input)
         self.model_name_combo = QComboBox()
-        self.model_name_combo.addItem("gpt-5-mini")
-        self.model_name_combo.addItem("gpt-5.4-mini")
-        self.model_name_combo.addItem("gpt-5.6-luna")
+        self.model_name_combo.addItems(list(MODEL_PRICING_PER_MILLION_TOKENS))
         self.model_name_combo.setCurrentText("gpt-5.6-luna")
         self.model_name_combo.currentIndexChanged.connect(self._refresh_provider_state)
         provider_layout.addRow("Model name", self.model_name_combo)
@@ -484,10 +302,11 @@ class DocumentProcessorWindow(QMainWindow):
         self.output_structure_editor.setEnabled(not is_markdown_mode)
         self.output_structure_label.setVisible(not is_markdown_mode)
         self.output_structure_editor.setVisible(not is_markdown_mode)
-        if is_markdown_mode:
-            self.prompt_instruction_label.setText("Additional page-transcription instructions")
-        else:
-            self.prompt_instruction_label.setText("Task instructions (applied independently to every document)")
+        self.prompt_instruction_label.setText(
+            "Additional page-transcription instructions"
+            if is_markdown_mode
+            else "Task instructions (applied independently to every document)"
+        )
 
     def _build_queue_panel(self) -> QWidget:
         panel = QGroupBox("4. Results queue")
@@ -571,12 +390,9 @@ class DocumentProcessorWindow(QMainWindow):
         for row, item in enumerate(self._documents):
             self.document_table.setItem(row, 0, QTableWidgetItem(item.path.name))
             self.document_table.setItem(row, 1, QTableWidgetItem(item.status.value.replace("_", " ").title()))
-            self.document_table.setItem(row, 2, QTableWidgetItem(self._document_detail(item)))
+            self.document_table.setItem(row, 2, QTableWidgetItem(item.message or "Ready for vision processing"))
         ready_count = sum(item.is_ready for item in self._documents)
         self.document_count_label.setText(f"{ready_count} ready")
-
-    def _document_detail(self, item: DocumentItem) -> str:
-        return item.message or "Ready for vision processing"
 
     def _refresh_provider_state(self) -> None:
         kind = self.provider_combo.currentData()
@@ -597,34 +413,22 @@ class DocumentProcessorWindow(QMainWindow):
         self.process_button.setEnabled(readiness.ready)
 
     def _validate_batch(self, show_success: bool = True) -> bool:
-        prompt = self.prompt_editor.toPlainText().strip()
-        if not prompt:
+        if not self.prompt_editor.toPlainText().strip():
             QMessageBox.warning(self, "Task prompt required", "Enter the prompt to apply to every document.")
             return False
+        # inspect_document only marks supported PDFs as ready, so no separate file-type check is needed.
         if not any(item.is_ready for item in self._documents):
             QMessageBox.warning(self, "Documents required", "Add at least one supported document.")
             return False
-        mode = self._processing_mode()
-        non_pdf_documents = [item.path.name for item in self._documents if item.is_ready and item.extension != ".pdf"]
-        if non_pdf_documents:
-            QMessageBox.warning(
-                self,
-                "Vision processing requires PDF documents",
-                "Only PDFs can be processed. Remove the following files: " + ", ".join(non_pdf_documents),
-            )
-            return False
-        if mode is ProcessingMode.PDF_MARKDOWN:
-            if show_success:
-                self.queue_status.setText("Batch is valid. Configure Microsoft Foundry to enable processing.")
-            return True
-        try:
-            output_structure = json.loads(self.output_structure_editor.toPlainText())
-        except json.JSONDecodeError as error:
-            QMessageBox.warning(self, "Invalid output structure", f"The output structure cannot be parsed: {error.msg}")
-            return False
-        if output_structure.get("type") != "object":
-            QMessageBox.warning(self, "Invalid output structure", "The output structure must define a JSON object.")
-            return False
+        if self._processing_mode() is not ProcessingMode.PDF_MARKDOWN:
+            try:
+                output_structure = json.loads(self.output_structure_editor.toPlainText())
+            except json.JSONDecodeError as error:
+                QMessageBox.warning(self, "Invalid output structure", f"The output structure cannot be parsed: {error.msg}")
+                return False
+            if not isinstance(output_structure, dict) or output_structure.get("type") != "object":
+                QMessageBox.warning(self, "Invalid output structure", "The output structure must define a JSON object.")
+                return False
         if show_success:
             self.queue_status.setText("Batch is valid. Configure Microsoft Foundry to enable processing.")
         return True
@@ -632,15 +436,16 @@ class DocumentProcessorWindow(QMainWindow):
     def _start_batch(self) -> None:
         if not self._validate_batch(show_success=False):
             return
-        if not self._provider.readiness().ready:
-            QMessageBox.warning(self, "Provider configuration required", self._provider.readiness().message)
+        readiness = self._provider.readiness()
+        if not readiness.ready:
+            QMessageBox.warning(self, "Provider configuration required", readiness.message)
             return
         self.process_button.setEnabled(False)
-        mode = self._processing_mode()
-        if mode is ProcessingMode.PDF_MARKDOWN:
-            self.queue_status.setText("Transcribing each PDF page in an independent Microsoft Foundry request…")
-        else:
-            self.queue_status.setText("Processing each document in an independent Microsoft Foundry request…")
+        self.queue_status.setText(
+            "Transcribing each PDF page in an independent Microsoft Foundry request…"
+            if self._processing_mode() is ProcessingMode.PDF_MARKDOWN
+            else "Processing each document in an independent Microsoft Foundry request…"
+        )
         self.token_usage_label.setText("Calculating batch token usage…")
         self.progress_log.clear()
         threading.Thread(target=self._run_batch, daemon=True).start()
@@ -661,49 +466,40 @@ class DocumentProcessorWindow(QMainWindow):
         if total == 0:
             self.batch_failed.emit("No ready documents to process.")
             return
-        max_workers = max(1, min(self.concurrency_spin.value(), total))
+        max_workers = min(self.concurrency_spin.value(), total)
         self.batch_progress.emit(f"Starting batch: {total} document(s), up to {max_workers} at a time.")
 
         # Results are stored by original document index so the output order is stable
         # regardless of which concurrent request finishes first.
         results: list[dict[str, object]] = [{} for _ in range(total)]
-        prompt_tokens = 0
-        completion_tokens = 0
-        cached_prompt_tokens = 0
-        completed = 0
+        usages: list[object] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {
                 executor.submit(self._process_single_document, document, mode, prompt, output_structure): index
                 for index, document in enumerate(ready_documents)
             }
-            # Token totals accumulate here in this single thread, so no extra locking is required.
-            for future in as_completed(future_to_index):
+            for completed, future in enumerate(as_completed(future_to_index), start=1):
                 index = future_to_index[future]
+                document = ready_documents[index]
                 try:
                     result, usage = future.result()
                 except Exception as error:
-                    result = {
-                        "document": ready_documents[index].path.name,
-                        "input_mode": mode.value,
-                        "status": "failed",
-                        "error": f"Unexpected processing failure ({type(error).__name__}): {error}",
-                    }
+                    result = _failed_result(
+                        document, mode, f"Unexpected processing failure ({type(error).__name__}): {error}"
+                    )
                     usage = {}
                 results[index] = result
-                prompt_tokens += _token_count(usage, "prompt_tokens")
-                completion_tokens += _token_count(usage, "completion_tokens")
-                cached_prompt_tokens += _cached_token_count(usage)
-                completed += 1
-                remaining = total - completed
+                usages.append(usage)
                 status = str(result.get("status", "processed")).replace("_", " ").title()
                 self.batch_progress.emit(
-                    f"{status} {completed}/{total}: {ready_documents[index].path.name} ({remaining} remaining)"
+                    f"{status} {completed}/{total}: {document.path.name} ({total - completed} remaining)"
                 )
+        batch_usage = _combine_usage(usages)
         self.batch_completed.emit(
             json.dumps(results, indent=2, ensure_ascii=False),
-            prompt_tokens,
-            cached_prompt_tokens,
-            completion_tokens,
+            _token_count(batch_usage, "prompt_tokens"),
+            _cached_token_count(batch_usage),
+            _token_count(batch_usage, "completion_tokens"),
             self.model_name_combo.currentText(),
         )
 
@@ -714,7 +510,7 @@ class DocumentProcessorWindow(QMainWindow):
         prompt: str,
         output_structure: dict[str, object],
     ) -> tuple[dict[str, object], dict[str, object]]:
-        """Process one document in a worker thread, retrying only on rate limits.
+        """Process one document in a worker thread.
 
         Returns the per-document result row and its token usage. A single document's
         failure is captured as a ``failed`` result row so the rest of the batch continues.
@@ -722,117 +518,68 @@ class DocumentProcessorWindow(QMainWindow):
         if mode is ProcessingMode.PDF_MARKDOWN:
             return self._process_pdf_markdown_document(document, prompt)
 
-        last_error: Exception | None = None
-        for attempt in range(MAX_REQUEST_ATTEMPTS):
-            try:
-                self.batch_progress.emit(
-                    f"Processing {document.path.name}: attempt {attempt + 1}/{MAX_REQUEST_ATTEMPTS}."
-                )
-                response = self._provider.process_pdf_images(render_pdf_pages(document), prompt, output_structure)
-                usage = response.pop("usage", {})
-                return (
-                    {"document": document.path.name, "input_mode": mode.value, "status": "completed", **response},
-                    usage if isinstance(usage, dict) else {},
-                )
-            except (ProviderRateLimitError, ProviderTransientError) as error:
-                last_error = error
-                if attempt < MAX_REQUEST_ATTEMPTS - 1:
-                    retry_delay = RETRY_BACKOFF_SECONDS * (2 ** attempt)
-                    self.batch_progress.emit(
-                        f"Transient provider failure for {document.path.name}: retrying in {retry_delay:.0f}s."
-                    )
-                    time.sleep(retry_delay)
-            except (PdfRenderingError, ProviderError, json.JSONDecodeError) as error:
-                last_error = error
-                break
+        try:
+            page_images = render_pdf_pages(document)
+            response = self._request_with_retries(
+                partial(self._provider.process_pdf_images, page_images, prompt, output_structure),
+                document.path.name,
+            )
+        except (PdfRenderingError, ProviderError) as error:
+            return _failed_result(document, mode, str(error)), {}
+        usage = response.pop("usage", {})
         return (
-            {"document": document.path.name, "input_mode": mode.value, "status": "failed", "error": str(last_error)},
-            {},
+            {"document": document.path.name, "input_mode": mode.value, "status": "completed", **response},
+            usage if isinstance(usage, dict) else {},
         )
 
     def _process_pdf_markdown_document(self, document: DocumentItem, prompt: str) -> tuple[dict[str, object], dict[str, object]]:
         """Transcribe one PDF in ordered, isolated page requests and combine its Markdown output."""
+        mode = ProcessingMode.PDF_MARKDOWN
         try:
             page_images = render_pdf_pages(document)
         except PdfRenderingError as error:
-            return (
-                {
-                    "document": document.path.name,
-                    "input_mode": ProcessingMode.PDF_MARKDOWN.value,
-                    "status": "failed",
-                    "error": str(error),
-                },
-                {},
-            )
+            return _failed_result(document, mode, str(error)), {}
 
         page_sections: list[str] = []
-        prompt_tokens = 0
-        completion_tokens = 0
-        cached_prompt_tokens = 0
-        page_count = len(page_images)
+        page_usages: list[object] = []
         for page_number, page_image in enumerate(page_images, start=1):
-            response: dict[str, object] | None = None
-            last_error: Exception | None = None
-            for attempt in range(MAX_REQUEST_ATTEMPTS):
-                self.batch_progress.emit(
-                    f"Transcribing {document.path.name}: page {page_number}/{page_count}, "
-                    f"attempt {attempt + 1}/{MAX_REQUEST_ATTEMPTS}."
+            try:
+                response = self._request_with_retries(
+                    partial(self._provider.process_pdf_page_markdown, page_image, prompt),
+                    f"{document.path.name}, page {page_number}/{len(page_images)}",
                 )
-                try:
-                    candidate = self._provider.process_pdf_page_markdown(page_image, prompt)
-                    response = candidate if isinstance(candidate, dict) else None
-                    if response is None:
-                        raise ProviderError("Microsoft Foundry returned an unexpected page-transcription response.")
-                    break
-                except (ProviderRateLimitError, ProviderTransientError) as error:
-                    last_error = error
-                    if attempt < MAX_REQUEST_ATTEMPTS - 1:
-                        retry_delay = RETRY_BACKOFF_SECONDS * (2 ** attempt)
-                        self.batch_progress.emit(
-                            f"Transient provider failure for {document.path.name}, page {page_number}/{page_count}: "
-                            f"retrying in {retry_delay:.0f}s."
-                        )
-                        time.sleep(retry_delay)
-                except ProviderError as error:
-                    last_error = error
-                    break
-            if response is None:
-                message = str(last_error) if last_error is not None else "Page transcription did not return a response."
-                return (
-                    {
-                        "document": document.path.name,
-                        "input_mode": ProcessingMode.PDF_MARKDOWN.value,
-                        "status": "failed",
-                        "error": f"Page {page_number}: {message}",
-                    },
-                    _markdown_usage(prompt_tokens, cached_prompt_tokens, completion_tokens),
-                )
-            markdown = response.get("text")
-            if not isinstance(markdown, str):
-                return (
-                    {
-                        "document": document.path.name,
-                        "input_mode": ProcessingMode.PDF_MARKDOWN.value,
-                        "status": "failed",
-                        "error": f"Page {page_number}: Microsoft Foundry returned non-text Markdown content.",
-                    },
-                    _markdown_usage(prompt_tokens, cached_prompt_tokens, completion_tokens),
-                )
+                markdown = response.get("text")
+                if not isinstance(markdown, str):
+                    raise ProviderError("Microsoft Foundry returned non-text Markdown content.")
+            except ProviderError as error:
+                # Keep usage from pages that already succeeded so the batch cost stays accurate.
+                return _failed_result(document, mode, f"Page {page_number}: {error}"), _combine_usage(page_usages)
             page_sections.append(f"## Page {page_number}\n\n{_remove_markdown_code_fence(markdown).strip()}")
-            response_usage = response.get("usage")
-            prompt_tokens += _token_count(response_usage, "prompt_tokens")
-            completion_tokens += _token_count(response_usage, "completion_tokens")
-            cached_prompt_tokens += _cached_token_count(response_usage)
+            page_usages.append(response.get("usage"))
 
         return (
             {
                 "document": document.path.name,
-                "input_mode": ProcessingMode.PDF_MARKDOWN.value,
+                "input_mode": mode.value,
                 "status": "completed",
                 "text": "\n\n".join(page_sections) + "\n",
             },
-            _markdown_usage(prompt_tokens, cached_prompt_tokens, completion_tokens),
+            _combine_usage(page_usages),
         )
+
+    def _request_with_retries(self, send: Callable[[], dict[str, object]], label: str) -> dict[str, object]:
+        """Call ``send``, retrying throttled and transient provider failures with exponential backoff."""
+        for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+            self.batch_progress.emit(f"Processing {label}: attempt {attempt}/{MAX_REQUEST_ATTEMPTS}.")
+            try:
+                return send()
+            except (ProviderRateLimitError, ProviderTransientError):
+                if attempt == MAX_REQUEST_ATTEMPTS:
+                    raise
+                retry_delay = RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                self.batch_progress.emit(f"Transient provider failure for {label}: retrying in {retry_delay:.0f}s.")
+                time.sleep(retry_delay)
+        raise ProviderError("No provider request was attempted.")
 
     def _on_batch_completed(
         self,
@@ -856,7 +603,7 @@ class DocumentProcessorWindow(QMainWindow):
             if _is_pdf_markdown_batch(batch_results):
                 additional_output_paths = _write_markdown_outputs(batch_results, output_path)
             else:
-                additional_output_paths = _write_csv_outputs(results, output_path)
+                additional_output_paths = _write_csv_outputs(batch_results, output_path)
         except (OSError, TypeError, json.JSONDecodeError) as error:
             self.queue_status.setText(f"Batch completed, but results could not be written to disk: {error}")
         else:
@@ -877,13 +624,49 @@ class DocumentProcessorWindow(QMainWindow):
         QMessageBox.warning(self, "Batch processing failed", error)
 
 
-def main() -> None:
-    application = QApplication(sys.argv)
-    application.setApplicationName("Document Processor")
-    window = DocumentProcessorWindow()
-    window.show()
-    raise SystemExit(application.exec())
+# --- Result rows and token usage ------------------------------------------------------------------------------
 
+def _failed_result(document: DocumentItem, mode: ProcessingMode, error: str) -> dict[str, object]:
+    """Build the result row recorded for a document that could not be processed."""
+    return {"document": document.path.name, "input_mode": mode.value, "status": "failed", "error": error}
+
+
+def _token_count(usage: object, field_name: str) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    value = usage.get(field_name)
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _cached_token_count(usage: object) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    return _token_count(usage.get("prompt_tokens_details"), "cached_tokens")
+
+
+def _combine_usage(usages: Iterable[object]) -> dict[str, object]:
+    """Sum several provider usage records into one record of the same shape."""
+    usages = list(usages)
+    return {
+        "prompt_tokens": sum(_token_count(usage, "prompt_tokens") for usage in usages),
+        "completion_tokens": sum(_token_count(usage, "completion_tokens") for usage in usages),
+        "prompt_tokens_details": {"cached_tokens": sum(_cached_token_count(usage) for usage in usages)},
+    }
+
+
+def _calculate_batch_cost(model_name: str, prompt_tokens: int, cached_prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimate batch cost from returned token counts and the selected model's USD rates per million tokens."""
+    pricing = MODEL_PRICING_PER_MILLION_TOKENS[model_name]
+    cached_tokens = min(cached_prompt_tokens, prompt_tokens)
+    uncached_prompt_tokens = prompt_tokens - cached_tokens
+    return (
+        (uncached_prompt_tokens * pricing["input"])
+        + (cached_tokens * pricing["cached_input"])
+        + (completion_tokens * pricing["output"])
+    ) / 1_000_000
+
+
+# --- JSON and Markdown output ---------------------------------------------------------------------------------
 
 def _default_output_dir() -> Path:
     """Default folder for JSON, CSV, and Markdown results, relative to the current working directory."""
@@ -906,15 +689,6 @@ def _remove_markdown_code_fence(markdown: str) -> str:
     return markdown
 
 
-def _markdown_usage(prompt_tokens: int, cached_prompt_tokens: int, completion_tokens: int) -> dict[str, object]:
-    """Return accumulated page-level usage in the same shape used by the batch cost display."""
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": cached_prompt_tokens},
-    }
-
-
 def _is_pdf_markdown_batch(batch_results: list[object]) -> bool:
     """Identify batches that use the page-by-page PDF Markdown processing mode."""
     return any(
@@ -928,11 +702,11 @@ def _write_markdown_outputs(batch_results: list[object], json_output_path: Path)
     """Write one consolidated Markdown file for every successfully transcribed PDF in a batch."""
     output_paths: list[Path] = []
     for source_index, batch_result in enumerate(batch_results, start=1):
-        if not isinstance(batch_result, dict):
-            continue
-        if batch_result.get("input_mode") != ProcessingMode.PDF_MARKDOWN.value:
-            continue
-        if batch_result.get("status") != "completed":
+        if (
+            not isinstance(batch_result, dict)
+            or batch_result.get("input_mode") != ProcessingMode.PDF_MARKDOWN.value
+            or batch_result.get("status") != "completed"
+        ):
             continue
         markdown = batch_result.get("text")
         if not isinstance(markdown, str):
@@ -946,35 +720,12 @@ def _write_markdown_outputs(batch_results: list[object], json_output_path: Path)
     return tuple(output_paths)
 
 
-def _token_count(usage: object, field_name: str) -> int:
-    if not isinstance(usage, dict):
-        return 0
-    value = usage.get(field_name)
-    return value if isinstance(value, int) and value >= 0 else 0
+# --- CSV output -----------------------------------------------------------------------------------------------
 
-
-def _cached_token_count(usage: object) -> int:
-    if not isinstance(usage, dict):
-        return 0
-    return _token_count(usage.get("prompt_tokens_details"), "cached_tokens")
-
-
-def _calculate_batch_cost(model_name: str, prompt_tokens: int, cached_prompt_tokens: int, completion_tokens: int) -> float:
-    """Estimate batch cost from returned token counts and the selected model's USD rates per million tokens."""
-    pricing = MODEL_PRICING_PER_MILLION_TOKENS[model_name]
-    cached_tokens = min(cached_prompt_tokens, prompt_tokens)
-    uncached_prompt_tokens = prompt_tokens - cached_tokens
-    return (
-        (uncached_prompt_tokens * pricing["input"])
-        + (cached_tokens * pricing["cached_input"])
-        + (completion_tokens * pricing["output"])
-    ) / 1_000_000
-
-
-CSV_FIELDNAMES = (
-    "document",
-    "input_mode",
-    "status",
+# Batch-level columns that lead every CSV row.
+RESULT_CONTEXT_FIELDS = ("document", "input_mode", "status")
+SOIL_LAB_SUMMARY_CSV_FIELDNAMES = (
+    *RESULT_CONTEXT_FIELDS,
     "test_type",
     "borehole",
     "sample_id",
@@ -983,27 +734,68 @@ CSV_FIELDNAMES = (
     "result_value",
     "result_unit",
 )
+BOREHOLE_LOG_FIELDS = ("borehole_id", "surface_elevation", "depth_unit")
+BOREHOLE_SAMPLE_FIELDS = ("sample_id", "top_depth", "bottom_depth", "blow_count")
+BOREHOLE_SOIL_FIELDS = ("top_depth", "bottom_depth", "description")
+BOREHOLE_SAMPLE_CSV_FIELDNAMES = (*RESULT_CONTEXT_FIELDS, *BOREHOLE_LOG_FIELDS, *BOREHOLE_SAMPLE_FIELDS)
+BOREHOLE_SOIL_CSV_FIELDNAMES = (*RESULT_CONTEXT_FIELDS, *BOREHOLE_LOG_FIELDS, *BOREHOLE_SOIL_FIELDS)
+GEOTECH_LAB_REPORT_METADATA_FIELDS = (
+    "test_type",
+    "location",
+    "sample_number",
+    "project_number",
+    "project",
+    "report_date",
+    "summary",
+)
+GEOTECH_LAB_REPORT_BASE_FIELDNAMES = (*RESULT_CONTEXT_FIELDS, *GEOTECH_LAB_REPORT_METADATA_FIELDS, "row_number")
 
 
-def _write_csv_file(results: str, json_output_path: Path) -> Path:
-    """Flatten completed soil laboratory results into one CSV row per reported result."""
-    batch_results = json.loads(results)
+def _write_csv_outputs(batch_results: list[dict[str, object]], json_output_path: Path) -> tuple[Path, ...]:
+    """Write template-appropriate CSV(s), choosing the layout from the fields the model returned."""
+    if _batch_has_field(batch_results, "borehole_id", "soil_descriptions"):
+        return _write_borehole_log_csv_files(batch_results, json_output_path)
+    if _batch_has_field(batch_results, "result_columns", "result_rows"):
+        return (_write_geotech_lab_report_csv_file(batch_results, json_output_path),)
+    return (_write_soil_lab_summary_csv_file(batch_results, json_output_path),)
+
+
+def _parse_extracted(batch_result: object) -> dict[str, object]:
+    """Return a result row's extracted JSON object, or {} when it is missing or malformed."""
+    if not isinstance(batch_result, dict):
+        return {}
+    try:
+        extracted = json.loads(batch_result.get("text", "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return extracted if isinstance(extracted, dict) else {}
+
+
+def _batch_has_field(batch_results: list[dict[str, object]], *field_names: str) -> bool:
+    """Return True when any result's extracted JSON contains one of ``field_names``."""
+    for batch_result in batch_results:
+        extracted = _parse_extracted(batch_result)
+        if any(field_name in extracted for field_name in field_names):
+            return True
+    return False
+
+
+def _result_context(batch_result: dict[str, object]) -> dict[str, object]:
+    return {field: batch_result.get(field) for field in RESULT_CONTEXT_FIELDS}
+
+
+def _write_soil_lab_summary_csv_file(batch_results: list[dict[str, object]], json_output_path: Path) -> Path:
+    """Flatten soil laboratory summaries into one CSV row per reported result."""
     csv_output_path = json_output_path.with_suffix(".csv")
     with csv_output_path.open("w", encoding="utf-8-sig", newline="") as target:
-        writer = csv.DictWriter(target, fieldnames=CSV_FIELDNAMES)
+        writer = csv.DictWriter(target, fieldnames=SOIL_LAB_SUMMARY_CSV_FIELDNAMES)
         writer.writeheader()
         for batch_result in batch_results:
-            batch_context = {
-                "document": batch_result.get("document"),
-                "input_mode": batch_result.get("input_mode"),
-                "status": batch_result.get("status"),
-            }
-            extracted_result = json.loads(batch_result.get("text", "{}"))
-            result_context = {**batch_context, "test_type": extracted_result.get("test_type")}
-            samples = extracted_result.get("samples", [])
+            extracted = _parse_extracted(batch_result)
+            result_context = {**_result_context(batch_result), "test_type": extracted.get("test_type")}
+            samples = extracted.get("samples") or []
             if not samples:
                 writer.writerow(result_context)
-                continue
             for sample in samples:
                 sample_context = {
                     **result_context,
@@ -1011,10 +803,9 @@ def _write_csv_file(results: str, json_output_path: Path) -> Path:
                     "sample_id": sample.get("sample_id"),
                     "depth": sample.get("depth"),
                 }
-                key_results = sample.get("key_results", [])
+                key_results = sample.get("key_results") or []
                 if not key_results:
                     writer.writerow(sample_context)
-                    continue
                 for key_result in key_results:
                     writer.writerow(
                         {
@@ -1025,84 +816,6 @@ def _write_csv_file(results: str, json_output_path: Path) -> Path:
                         }
                     )
     return csv_output_path
-
-
-BOREHOLE_SAMPLE_CSV_FIELDNAMES = (
-    "document",
-    "input_mode",
-    "status",
-    "borehole_id",
-    "surface_elevation",
-    "depth_unit",
-    "sample_id",
-    "top_depth",
-    "bottom_depth",
-    "blow_count",
-)
-BOREHOLE_SOIL_CSV_FIELDNAMES = (
-    "document",
-    "input_mode",
-    "status",
-    "borehole_id",
-    "surface_elevation",
-    "depth_unit",
-    "top_depth",
-    "bottom_depth",
-    "description",
-)
-
-
-def _write_csv_outputs(results: str, json_output_path: Path) -> tuple[Path, ...]:
-    """Write template-appropriate CSV(s): borehole logs split into sample and soil-description files; other templates keep one CSV."""
-    batch_results = json.loads(results)
-    if _is_borehole_log_batch(batch_results):
-        return _write_borehole_log_csv_files(batch_results, json_output_path)
-    if _is_geotech_lab_report_batch(batch_results):
-        return (_write_geotech_lab_report_csv_file(batch_results, json_output_path),)
-    return (_write_csv_file(results, json_output_path),)
-
-
-def _is_borehole_log_batch(batch_results: list[dict[str, object]]) -> bool:
-    """Detect the borehole-log schema by its page-level borehole_id or soil_descriptions fields."""
-    for batch_result in batch_results:
-        if not isinstance(batch_result, dict):
-            continue
-        try:
-            extracted = json.loads(batch_result.get("text", "{}"))
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(extracted, dict) and ("borehole_id" in extracted or "soil_descriptions" in extracted):
-            return True
-    return False
-
-
-GEOTECH_LAB_REPORT_BASE_FIELDNAMES = (
-    "document",
-    "input_mode",
-    "status",
-    "test_type",
-    "location",
-    "sample_number",
-    "project_number",
-    "project",
-    "report_date",
-    "summary",
-    "row_number",
-)
-
-
-def _is_geotech_lab_report_batch(batch_results: list[dict[str, object]]) -> bool:
-    """Detect the geotechnical lab report schema by its 'result_columns'/'result_rows' fields."""
-    for batch_result in batch_results:
-        if not isinstance(batch_result, dict):
-            continue
-        try:
-            extracted = json.loads(batch_result.get("text", "{}"))
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(extracted, dict) and ("result_columns" in extracted or "result_rows" in extracted):
-            return True
-    return False
 
 
 def _normalize_header(header: str) -> str:
@@ -1123,48 +836,29 @@ def _write_geotech_lab_report_csv_file(batch_results: list[dict[str, object]], j
     result column seen across the batch, in first-seen order; unused cells stay blank. Headers
     that differ only in punctuation, spacing, or case are merged into the first-seen spelling.
     """
-    column_order: list[str] = []
-    canonical_to_display: dict[str, str] = {}
     base_canonicals = {_normalize_header(name) for name in GEOTECH_LAB_REPORT_BASE_FIELDNAMES}
-    parsed_documents: list[tuple[dict[str, object], dict[str, object]]] = []
-    # First pass: parse each document once and collect the union of result columns by canonical key.
-    for batch_result in batch_results:
-        try:
-            extracted = json.loads(batch_result.get("text", "{}"))
-        except (TypeError, json.JSONDecodeError):
-            extracted = {}
-        if not isinstance(extracted, dict):
-            extracted = {}
-        parsed_documents.append((batch_result, extracted))
-        for column in extracted.get("result_columns", []) or []:
+    parsed_documents = [(batch_result, _parse_extracted(batch_result)) for batch_result in batch_results]
+    # Canonical header -> first-seen spelling; insertion order gives the CSV column order.
+    canonical_to_display: dict[str, str] = {}
+    for _, extracted in parsed_documents:
+        for column in extracted.get("result_columns") or []:
             canonical = _normalize_header(column)
-            if not canonical or canonical in base_canonicals or canonical in canonical_to_display:
-                continue
-            canonical_to_display[canonical] = column
-            column_order.append(column)
-    fieldnames = (*GEOTECH_LAB_REPORT_BASE_FIELDNAMES, *column_order)
+            if canonical and canonical not in base_canonicals:
+                canonical_to_display.setdefault(canonical, column)
+    fieldnames = (*GEOTECH_LAB_REPORT_BASE_FIELDNAMES, *canonical_to_display.values())
     csv_output_path = json_output_path.with_suffix(".csv")
     with csv_output_path.open("w", encoding="utf-8-sig", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for batch_result, extracted in parsed_documents:
             metadata = {
-                "document": batch_result.get("document"),
-                "input_mode": batch_result.get("input_mode"),
-                "status": batch_result.get("status"),
-                "test_type": extracted.get("test_type"),
-                "location": extracted.get("location"),
-                "sample_number": extracted.get("sample_number"),
-                "project_number": extracted.get("project_number"),
-                "project": extracted.get("project"),
-                "report_date": extracted.get("report_date"),
-                "summary": extracted.get("summary"),
+                **_result_context(batch_result),
+                **{field: extracted.get(field) for field in GEOTECH_LAB_REPORT_METADATA_FIELDS},
             }
-            columns = extracted.get("result_columns", []) or []
-            rows = extracted.get("result_rows", []) or []
+            columns = extracted.get("result_columns") or []
+            rows = extracted.get("result_rows") or []
             if not rows:
                 writer.writerow(metadata)
-                continue
             for row_number, row in enumerate(rows, start=1):
                 # Route each cell to the merged first-seen header via its canonical key.
                 cell_map = {
@@ -1188,38 +882,29 @@ def _write_borehole_log_csv_files(batch_results: list[dict[str, object]], json_o
         samples_writer.writeheader()
         soil_writer.writeheader()
         for batch_result in batch_results:
-            extracted = json.loads(batch_result.get("text", "{}"))
+            extracted = _parse_extracted(batch_result)
             log_context = {
-                "document": batch_result.get("document"),
-                "input_mode": batch_result.get("input_mode"),
-                "status": batch_result.get("status"),
-                "borehole_id": extracted.get("borehole_id"),
-                "surface_elevation": extracted.get("surface_elevation"),
-                "depth_unit": extracted.get("depth_unit"),
+                **_result_context(batch_result),
+                **{field: extracted.get(field) for field in BOREHOLE_LOG_FIELDS},
             }
-            samples = extracted.get("samples", [])
+            samples = extracted.get("samples") or []
             if not samples:
                 samples_writer.writerow(log_context)
             for sample in samples:
-                samples_writer.writerow(
-                    {
-                        **log_context,
-                        "sample_id": sample.get("sample_id"),
-                        "top_depth": sample.get("top_depth"),
-                        "bottom_depth": sample.get("bottom_depth"),
-                        "blow_count": sample.get("blow_count"),
-                    }
-                )
-            soil_descriptions = extracted.get("soil_descriptions", [])
+                samples_writer.writerow({**log_context, **{field: sample.get(field) for field in BOREHOLE_SAMPLE_FIELDS}})
+            soil_descriptions = extracted.get("soil_descriptions") or []
             if not soil_descriptions:
                 soil_writer.writerow(log_context)
             for soil_description in soil_descriptions:
                 soil_writer.writerow(
-                    {
-                        **log_context,
-                        "top_depth": soil_description.get("top_depth"),
-                        "bottom_depth": soil_description.get("bottom_depth"),
-                        "description": soil_description.get("description"),
-                    }
+                    {**log_context, **{field: soil_description.get(field) for field in BOREHOLE_SOIL_FIELDS}}
                 )
     return (samples_path, soil_path)
+
+
+def main() -> None:
+    application = QApplication(sys.argv)
+    application.setApplicationName("Document Processor")
+    window = DocumentProcessorWindow()
+    window.show()
+    raise SystemExit(application.exec())

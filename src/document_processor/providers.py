@@ -1,4 +1,4 @@
-"""Provider contracts. Concrete network providers are intentionally not implemented yet."""
+"""Provider contract and the Microsoft Foundry chat-completions implementation."""
 
 from __future__ import annotations
 
@@ -93,62 +93,47 @@ class MicrosoftFoundryProvider(DocumentProvider):
         self._configuration = configuration
 
     def readiness(self) -> ProviderReadiness:
-        if self._configuration is None:
+        configuration = self._configuration
+        if configuration is None:
             message = "Enter the Microsoft Foundry endpoint URL, API key, and model name."
-        elif not self._configuration.endpoint.strip() or not self._configuration.api_key.strip() or not self._configuration.model_id.strip():
+        elif not (configuration.endpoint.strip() and configuration.api_key.strip() and configuration.model_id.strip()):
             message = "Endpoint URL, API key, and model name are all required."
-        elif not self._configuration.endpoint.strip().lower().startswith("https://"):
+        elif not configuration.endpoint.strip().lower().startswith("https://"):
             message = "Endpoint must be an HTTPS URL."
         else:
-            message = "Ready. Each document will be sent in an independent Foundry request."
-        return ProviderReadiness(
-            ProviderKind.MICROSOFT_FOUNDRY,
-            self._configuration is not None
-            and bool(self._configuration.endpoint.strip())
-            and self._configuration.endpoint.strip().lower().startswith("https://")
-            and bool(self._configuration.api_key.strip())
-            and bool(self._configuration.model_id.strip()),
-            message,
-        )
+            return ProviderReadiness(
+                ProviderKind.MICROSOFT_FOUNDRY, True, "Ready. Each document will be sent in an independent Foundry request."
+            )
+        return ProviderReadiness(ProviderKind.MICROSOFT_FOUNDRY, False, message)
 
     def process_pdf_images(self, page_images: tuple[bytes, ...], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
-        if not self.readiness().ready:
-            raise ProviderNotReadyError(self.readiness().message)
+        configuration = self._ready_configuration()
         if not page_images:
             raise ProviderRequestError("The PDF did not produce any page images.")
-        assert self._configuration is not None
-
-        response = self._post_json(
-            self._configuration.endpoint,
-            _build_foundry_image_payload(
-                self._configuration.endpoint,
-                self._configuration.model_id,
-                prompt,
-                schema,
-                page_images,
-            ),
+        return self._complete(
+            _build_foundry_image_payload(configuration.endpoint, configuration.model_id, prompt, schema, page_images)
         )
-        return {
-            "text": _extract_foundry_text(response),
-            "usage": _extract_usage(response),
-        }
 
     def process_pdf_page_markdown(self, page_image: bytes, prompt: str) -> dict[str, Any]:
-        if not self.readiness().ready:
-            raise ProviderNotReadyError(self.readiness().message)
+        configuration = self._ready_configuration()
         if not page_image:
             raise ProviderRequestError("The PDF page did not produce an image.")
-        assert self._configuration is not None
-
-        response = self._post_json(
-            self._configuration.endpoint,
-            _build_foundry_markdown_page_payload(
-                self._configuration.endpoint,
-                self._configuration.model_id,
-                prompt,
-                page_image,
-            ),
+        return self._complete(
+            _build_foundry_markdown_page_payload(configuration.endpoint, configuration.model_id, prompt, page_image)
         )
+
+    def _ready_configuration(self) -> MicrosoftFoundryConfiguration:
+        """Return the configuration, or raise when it is not ready for a request."""
+        readiness = self.readiness()
+        if not readiness.ready:
+            raise ProviderNotReadyError(readiness.message)
+        assert self._configuration is not None
+        return self._configuration
+
+    def _complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send one chat-completions request and return its text and token usage."""
+        assert self._configuration is not None
+        response = self._post_json(self._configuration.endpoint, payload)
         return {
             "text": _extract_foundry_text(response),
             "usage": _extract_usage(response),
@@ -157,19 +142,8 @@ class MicrosoftFoundryProvider(DocumentProvider):
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         assert self._configuration is not None
         normalized_endpoint = _normalize_foundry_endpoint(endpoint, self._configuration.api_version.strip())
-        attempted_versions: list[str] = []
-        request = Request(
-            normalized_endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "api-key": self._configuration.api_key,
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         try:
-            with urlopen(request, timeout=FOUNDRY_REQUEST_TIMEOUT_SECONDS) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            return _send_foundry_request(normalized_endpoint, payload, self._configuration.api_key)
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             if _is_deployment_not_found(detail):
@@ -183,21 +157,7 @@ class MicrosoftFoundryProvider(DocumentProvider):
                     f"Provider response: {detail}"
                 ) from error
             if error.code == 400 and _is_api_version_not_supported(detail):
-                retried = _retry_foundry_versions(
-                    normalized_endpoint,
-                    payload,
-                    self._configuration.api_key,
-                    attempted_versions,
-                )
-                if retried is not None:
-                    return retried
-                attempted = ", ".join(attempted_versions) if attempted_versions else "none"
-                raise ProviderRequestError(
-                    "Microsoft Foundry rejected api-version. "
-                    f"Resolved endpoint: {normalized_endpoint}. Tried fallback api-versions: {attempted}. "
-                    "Set API version explicitly in the GUI to the value shown on your Foundry endpoint page. "
-                    f"Provider response: {detail}"
-                ) from error
+                return _retry_fallback_api_versions(normalized_endpoint, payload, self._configuration.api_key, detail)
             if error.code == 404:
                 raise ProviderRequestError(
                     "Microsoft Foundry returned 404 Resource not found. "
@@ -213,13 +173,28 @@ class MicrosoftFoundryProvider(DocumentProvider):
                     f"Microsoft Foundry throttled the request ({error.code}): {detail}"
                 ) from error
             raise ProviderRequestError(f"Microsoft Foundry request failed ({error.code}): {detail}") from error
-        except (URLError, OSError, HTTPException) as error:
-            raise ProviderTransientError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
-        except json.JSONDecodeError as error:
-            raise ProviderRequestError("Microsoft Foundry endpoint returned a non-JSON response.") from error
-        if not isinstance(data, dict):
-            raise ProviderRequestError("Microsoft Foundry endpoint returned an unexpected response shape.")
-        return data
+
+
+def _send_foundry_request(url: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """POST one JSON request; HTTPError propagates so callers can interpret the status code."""
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"api-key": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=FOUNDRY_REQUEST_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError:
+        raise
+    except (URLError, OSError, HTTPException) as error:
+        raise ProviderTransientError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ProviderRequestError("Microsoft Foundry endpoint returned a non-JSON response.") from error
+    if not isinstance(data, dict):
+        raise ProviderRequestError("Microsoft Foundry endpoint returned an unexpected response shape.")
+    return data
 
 
 def _normalize_foundry_endpoint(endpoint: str, api_version: str = "") -> str:
@@ -268,31 +243,16 @@ def _build_foundry_image_payload(
     page_images: tuple[bytes, ...],
 ) -> dict[str, Any]:
     """Build one vision request containing every rendered page for one PDF."""
-    content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": _build_structured_vision_prompt(prompt, schema),
-        }
+    content = [
+        {"type": "text", "text": _build_structured_vision_prompt(prompt, schema)},
+        *(_image_content(image) for image in page_images),
     ]
-    content.extend(
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{base64.b64encode(image).decode('ascii')}"},
-        }
-        for image in page_images
+    return _build_chat_payload(
+        endpoint,
+        model_id,
+        "Use only the provided document content in this request. Do not rely on prior turns.",
+        content,
     )
-    payload: dict[str, Any] = {
-        "messages": [
-            {
-                "role": "system",
-                "content": "Use only the provided document content in this request. Do not rely on prior turns.",
-            },
-            {"role": "user", "content": content},
-        ],
-    }
-    if "/openai/deployments/" not in endpoint.lower():
-        payload["model"] = model_id
-    return payload
 
 
 def _build_foundry_markdown_page_payload(
@@ -305,22 +265,32 @@ def _build_foundry_markdown_page_payload(
     instructions = PDF_MARKDOWN_TRANSCRIPTION_INSTRUCTIONS
     if prompt.strip():
         instructions = f"{instructions}\n\nAdditional page instructions:\n{prompt.strip()}"
+    return _build_chat_payload(
+        endpoint,
+        model_id,
+        "Use only the supplied document page in this request. Do not rely on prior turns.",
+        [{"type": "text", "text": instructions}, _image_content(page_image)],
+    )
+
+
+def _image_content(image: bytes) -> dict[str, Any]:
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{base64.b64encode(image).decode('ascii')}"},
+    }
+
+
+def _build_chat_payload(
+    endpoint: str,
+    model_id: str,
+    system_message: str,
+    user_content: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a single-turn chat request; deployment-style URLs already name the model."""
     payload: dict[str, Any] = {
         "messages": [
-            {
-                "role": "system",
-                "content": "Use only the supplied document page in this request. Do not rely on prior turns.",
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": instructions},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{base64.b64encode(page_image).decode('ascii')}"},
-                    },
-                ],
-            },
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_content},
         ],
     }
     if "/openai/deployments/" not in endpoint.lower():
@@ -371,40 +341,25 @@ def _replace_api_version(endpoint: str, api_version: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query), parsed.fragment))
 
 
-def _retry_foundry_versions(
+def _retry_fallback_api_versions(
     normalized_endpoint: str,
     payload: dict[str, Any],
     api_key: str,
-    attempted_versions: list[str],
-) -> dict[str, Any] | None:
-    parsed = urlparse(normalized_endpoint)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    current = query.get("api-version", "")
-    for version in FALLBACK_FOUNDRY_API_VERSIONS:
-        if not version or version == current:
-            continue
-        candidate = _replace_api_version(normalized_endpoint, version)
-        attempted_versions.append(version)
-        request = Request(
-            candidate,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "api-key": api_key,
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+    original_detail: str,
+) -> dict[str, Any]:
+    """Retry a request rejected for its api-version with each known fallback version."""
+    current = dict(parse_qsl(urlparse(normalized_endpoint).query)).get("api-version", "")
+    fallback_versions = [version for version in FALLBACK_FOUNDRY_API_VERSIONS if version != current]
+    for version in fallback_versions:
         try:
-            with urlopen(request, timeout=FOUNDRY_REQUEST_TIMEOUT_SECONDS) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            if isinstance(data, dict):
-                return data
+            return _send_foundry_request(_replace_api_version(normalized_endpoint, version), payload, api_key)
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             if error.code != 400 or not _is_api_version_not_supported(detail):
                 raise ProviderRequestError(f"Microsoft Foundry request failed ({error.code}): {detail}") from error
-        except (URLError, OSError, HTTPException) as error:
-            raise ProviderTransientError(f"Could not reach Microsoft Foundry endpoint: {error}") from error
-        except json.JSONDecodeError as error:
-            raise ProviderRequestError("Microsoft Foundry endpoint returned a non-JSON response.") from error
-    return None
+    raise ProviderRequestError(
+        "Microsoft Foundry rejected api-version. "
+        f"Resolved endpoint: {normalized_endpoint}. Tried fallback api-versions: {', '.join(fallback_versions) or 'none'}. "
+        "Set API version explicitly in the GUI to the value shown on your Foundry endpoint page. "
+        f"Provider response: {original_detail}"
+    )

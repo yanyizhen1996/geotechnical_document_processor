@@ -1,8 +1,8 @@
 # Document Processor workspace guidance
 
-- [x] Project requirements: Windows-local Python desktop application using PySide6 and SQLite. Microsoft Foundry is the primary provider; OpenAI is optional and policy-gated.
+- [x] Project requirements: Windows-local Python desktop application using PySide6. Microsoft Foundry is the primary provider; OpenAI is optional and policy-gated.
 - [x] Project scaffold: use a `src/` Python package layout and `pyproject.toml`.
-- [x] Customize the project: initial GUI shell, domain contracts, provider interface, and local SQLite scaffold are in scope.
+- [x] Customize the project: initial GUI shell, domain contracts, and provider interface are in scope.
 - [x] Install required extensions: no additional extension is required by this project.
 - [x] Compile and validate: dependencies installed and focused tests passed.
 - [x] Create and run task: not required for the initial Python package.

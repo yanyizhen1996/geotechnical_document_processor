@@ -10,7 +10,7 @@ All extraction is vision-based and PDF-only. Structured extraction templates ren
 
 The **General PDF Text transcription** extraction template uses the same in-memory page renderer, but sends exactly one rendered page to the vision model per request. Each page is asked to faithfully transcribe visible content, including headings, tables, form labels, handwriting, and values, into GitHub-Flavored Markdown. Page requests are ordered within their source PDF and are combined under `## Page N` headings into one Markdown file per successfully completed PDF. The batch retains its timestamped JSON status manifest but does not produce CSV files in this mode. Rate-limit and transient network/read-timeout failures are retried with exponential backoff; a page that still cannot be transcribed fails its source PDF instead of producing an incomplete Markdown file.
 
-It provides core domain, provider, and SQLite repository scaffolding. Foundry credentials stay in memory for the running session and are not written to disk.
+Extraction templates (prompts and output structures) live in `src/document_processor/templates.py`. Foundry credentials stay in memory for the running session and are not written to disk.
 
 ## Microsoft Foundry prerequisites
 
